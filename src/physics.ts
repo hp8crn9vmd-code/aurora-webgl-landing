@@ -29,7 +29,6 @@ function rand01(seed: number) {
 }
 
 function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
-  // divergence-free flow (smooth, non-repeating, feels alive)
   const e = 0.75;
   const n1 = noise2(x + e + t * 0.22, y);
   const n2 = noise2(x - e + t * 0.22, y);
@@ -50,11 +49,9 @@ function palette(mood: number, mode: ModeName) {
   return { r: 215, g: 190, b: 255 };
 }
 
-// Spatial Hash (anti-cluster)
 type CellKey = string;
 const cellKey = (ix: number, iy: number): CellKey => `${ix},${iy}`;
 
-// Fisher-Yates shuffle
 function shuffleInPlace<T>(a: T[]) {
   for (let i = a.length - 1; i > 0; i--) {
     const j = (Math.random() * (i + 1)) | 0;
@@ -89,40 +86,43 @@ export function createPhysicsLayer(
   let mood = 0;
   let mode: ModeName = "ICE";
 
-  // Premium art knobs
   const V = {
-    // visual
-    glowA: 0.090,
-    glassFill: 0.062,
-    glassStroke: 0.115,
-    innerLine: 0.060,
-    highlight: 0.10,
-    sparkleChance: 0.070,
+    // “real” rendering knobs
+    glowA: 0.085,
+    glassFill: 0.070,
+    glassStroke: 0.12,
+    fresnel: 0.085,       // rim light
+    specular: 0.14,       // highlight strength
+    shadowA: 0.07,        // under-shadow strength
+    sparkleChance: 0.060,
 
     // composition
     centerForce: 0.0000035,
     edgeRepel: 0.000012,
 
-    // anti-cluster (local repulsion)
+    // anti-cluster
     cellSize: 110,
     repelRadius: 95,
     repelForce: 0.000030,
 
-    // magnets / force field
+    // magnets (REPULSION ONLY)
     magnetCount: 4,
-    magnetForce: 0.000075,
-    magnetRadius: 560,
+    magnetForce: 0.000080,
+    magnetRadius: 620,
     magnetWobble: 0.18,
 
-    // micro-springs (local living tissue feeling)
+    // mouse behaves as repulsive magnet too (premium)
+    mouseRepelBoost: 1.25,
+
+    // springs
     springStiffness: 0.0022,
     springDamping: 0.14,
     springLenMin: 40,
     springLenMax: 120,
-    springPerBody: 1, // keep perf with many bodies
+    springPerBody: 1,
     maxSprings: 220,
 
-    // spawn distribution
+    // spawn
     spawnPadding: 32,
   } as const;
 
@@ -138,7 +138,6 @@ export function createPhysicsLayer(
     Composite.add(world, bounds);
   }
 
-  // Blue-noise-ish spawn: jittered grid + shuffle (prevents initial clustering)
   function spawnPoints(count: number) {
     const pts: { x: number; y: number }[] = [];
     const pad = V.spawnPadding;
@@ -147,8 +146,8 @@ export function createPhysicsLayer(
     const H = Math.max(1, h - pad * 2);
     const aspect = W / Math.max(H, 1);
 
-    const cols = Math.max(8, Math.round(Math.sqrt(count * aspect)));
-    const rows = Math.max(8, Math.round(count / cols));
+    const cols = Math.max(10, Math.round(Math.sqrt(count * aspect)));
+    const rows = Math.max(10, Math.round(count / cols));
 
     const dx = W / cols;
     const dy = H / rows;
@@ -160,13 +159,11 @@ export function createPhysicsLayer(
         pts.push({ x: clamp(x, pad, w - pad), y: clamp(y, pad, h - pad) });
       }
     }
-
     shuffleInPlace(pts);
     return pts.slice(0, count);
   }
 
   function makeCapsule(x: number, y: number, length: number, radius: number, common: any) {
-    // compound body: rect + 2 circles (professional "capsule" shape)
     const rect = Bodies.rectangle(x, y, Math.max(8, length), Math.max(6, radius * 2), {
       ...common,
       chamfer: { radius: radius * 0.85 },
@@ -174,21 +171,19 @@ export function createPhysicsLayer(
     const c1 = Bodies.circle(x - length * 0.5, y, radius, common);
     const c2 = Bodies.circle(x + length * 0.5, y, radius, common);
 
-    const body = Body.create({
+    return Body.create({
       parts: [rect, c1, c2],
       restitution: common.restitution,
       frictionAir: common.frictionAir,
       density: common.density,
     });
-    return body;
   }
 
   function makeBody(i: number, pt: { x: number; y: number }) {
     const x = pt.x;
     const y = pt.y;
 
-    // smaller sizes to allow “full screen filled”
-    const base = 6 + Math.random() * 10; // 6..16
+    const base = 6 + Math.random() * 10; // small => fill screen
     const kind = Math.random();
 
     const common = {
@@ -199,52 +194,36 @@ export function createPhysicsLayer(
 
     let b: Matter.Body;
 
-    // A) circle glass beads
     if (kind < 0.34) {
       b = Bodies.circle(x, y, base * (0.85 + Math.random() * 0.25), common);
-
-      // B) rounded rectangles (glass tiles)
     } else if (kind < 0.62) {
       b = Bodies.rectangle(
         x,
         y,
         base * (1.8 + Math.random() * 1.6),
         base * (1.0 + Math.random() * 1.2),
-        {
-          ...common,
-          chamfer: { radius: base * (0.45 + Math.random() * 0.25) },
-        },
+        { ...common, chamfer: { radius: base * (0.45 + Math.random() * 0.25) } },
       );
-
-      // C) rounded polygons (crystals)
     } else if (kind < 0.84) {
-      const sides = 3 + Math.floor(Math.random() * 6); // 3..8
+      const sides = 3 + Math.floor(Math.random() * 6);
       b = Bodies.polygon(x, y, sides, base * (1.0 + Math.random() * 0.6), {
         ...common,
         chamfer: { radius: base * (0.30 + Math.random() * 0.30) },
       });
-
-      // D) capsules (premium, dynamic)
     } else {
       const len = base * (2.2 + Math.random() * 2.2);
       const rad = base * (0.55 + Math.random() * 0.25);
       b = makeCapsule(x, y, len, rad, common);
     }
 
-    const polarity = rand01(i * 19.7) < 0.5 ? -1 : 1;
-
     (b as any)._style = {
       tint: rand01(i * 33.7) * 0.45 + 0.25,
       massBias: rand01(i * 12.2) * 0.8 + 0.6,
       flow: rand01(i * 66.6) * 1.7 + 0.4,
       impulse: rand01(i * 88.8) * 1.2 + 0.4,
-      polarity,
-      seed: Math.random() * 1e6,
-      // visual identity
       bias: rand01(i * 111.1),
     };
 
-    // give initial motion (subtle but alive)
     Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.12);
     Body.setVelocity(b, { x: (Math.random() - 0.5) * 2.0, y: (Math.random() - 0.5) * 2.0 });
 
@@ -272,10 +251,8 @@ export function createPhysicsLayer(
   }
 
   function addMicroSprings() {
-    // connect each body to a neighbor in nearby cells (local “living tissue”)
     const cs = V.cellSize;
     const grid = buildSpatialGrid(cs);
-
     let added = 0;
 
     for (const b of bodies) {
@@ -284,7 +261,6 @@ export function createPhysicsLayer(
       const ix = Math.floor(b.position.x / cs);
       const iy = Math.floor(b.position.y / cs);
 
-      // find candidates in neighbor cells
       const candidates: Matter.Body[] = [];
       for (let oy = -1; oy <= 1; oy++) {
         for (let ox = -1; ox <= 1; ox++) {
@@ -292,10 +268,8 @@ export function createPhysicsLayer(
           if (arr) candidates.push(...arr);
         }
       }
-
       if (candidates.length < 2) continue;
 
-      // pick one or two random neighbors (exclude self)
       for (let k = 0; k < V.springPerBody; k++) {
         if (added >= V.maxSprings) break;
 
@@ -306,7 +280,6 @@ export function createPhysicsLayer(
         const dy = other.position.y - b.position.y;
         const d = Math.sqrt(dx * dx + dy * dy);
 
-        // keep only local links
         if (d < V.springLenMin || d > V.springLenMax) continue;
 
         constraints.push(
@@ -333,8 +306,6 @@ export function createPhysicsLayer(
     for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i, pts[i % pts.length]));
 
     Composite.add(world, bodies);
-
-    // constraints ratio scaled down when huge counts (keep perf)
     addMicroSprings();
   }
 
@@ -359,7 +330,7 @@ export function createPhysicsLayer(
   }
 
   function magnetPositions(t: number) {
-    const mags: { x: number; y: number; pol: number }[] = [];
+    const mags: { x: number; y: number }[] = [];
     const a = Math.min(w, h) * 0.33;
     const cx = w * 0.5;
     const cy = h * 0.5;
@@ -374,9 +345,7 @@ export function createPhysicsLayer(
         cy +
         a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) +
         a * 0.42 * Math.cos(t * 0.13 + ph * 1.3);
-
-      const pol = Math.sin(t * 0.23 + ph) >= 0 ? 1 : -1;
-      mags.push({ x, y, pol });
+      mags.push({ x, y });
     }
     return mags;
   }
@@ -404,6 +373,7 @@ export function createPhysicsLayer(
             const dx = b.position.x - o.position.x;
             const dy = b.position.y - o.position.y;
             const d2 = dx * dx + dy * dy;
+
             if (d2 > 0.0001 && d2 < r2) {
               near++;
               const d = Math.sqrt(d2);
@@ -414,7 +384,6 @@ export function createPhysicsLayer(
         }
       }
 
-      // local density burst (prevents blobs)
       if (near >= 10) {
         const cx = w * 0.5;
         const cy = h * 0.5;
@@ -430,14 +399,14 @@ export function createPhysicsLayer(
     const wSafe = Math.max(w, 1);
     const hSafe = Math.max(h, 1);
 
-    // drifting anchors: coherence
     const ax = (0.5 + 0.16 * Math.sin(t * 0.17)) * wSafe;
     const ay = (0.5 + 0.16 * Math.cos(t * 0.13)) * hSafe;
 
     const mags = magnetPositions(t);
 
-    // anti-cluster first
     applyAntiClusterSpatialHash();
+
+    const mr2 = V.magnetRadius * V.magnetRadius;
 
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
@@ -446,8 +415,6 @@ export function createPhysicsLayer(
         impulse: number;
         massBias: number;
         tint: number;
-        polarity: number;
-        seed: number;
         bias: number;
       };
 
@@ -461,37 +428,35 @@ export function createPhysicsLayer(
         y: c.y * cfg.turbulence * 1.70 * st.flow,
       });
 
-      // super soft pull to moving anchor
+      // soft coherence drift
       Body.applyForce(b, b.position, {
         x: ((ax - b.position.x) / wSafe) * 0.000003,
         y: ((ay - b.position.y) / hSafe) * 0.000003,
       });
 
-      // magnets: mixed polarity = unpredictable
-      const mr2 = V.magnetRadius * V.magnetRadius;
+      // ✅ MAGNETS: REPULSION ONLY (push away from magnets)
       for (const m of mags) {
-        const dx = m.x - b.position.x;
-        const dy = m.y - b.position.y;
+        const dx = b.position.x - m.x; // away direction
+        const dy = b.position.y - m.y;
         const d2 = dx * dx + dy * dy;
         if (d2 < mr2) {
           const d = Math.sqrt(d2) + 0.001;
           const falloff = 1 - d / V.magnetRadius;
-          const sign = st.polarity * m.pol;
-          const strength = V.magnetForce * falloff * falloff * (0.70 + st.tint * 0.85);
-          Body.applyForce(b, b.position, { x: (dx / d) * strength * sign, y: (dy / d) * strength * sign });
+          const strength = V.magnetForce * falloff * falloff * (0.75 + st.tint * 0.85);
+          Body.applyForce(b, b.position, { x: (dx / d) * strength, y: (dy / d) * strength });
         }
       }
 
-      // mouse: premium "hand of god"
+      // ✅ Mouse: repulsive magnet (push away)
       const mdx = b.position.x / wSafe - mx;
       const mdy = b.position.y / hSafe - my;
       const md = Math.sqrt(mdx * mdx + mdy * mdy) * Math.max(wSafe, hSafe);
       if (md < cfg.mouseRadius) {
-        const s = (1 - md / cfg.mouseRadius) * cfg.mouseForce * 1.30;
-        Body.applyForce(b, b.position, { x: -mdx * s, y: -mdy * s });
+        const s = (1 - md / cfg.mouseRadius) * cfg.mouseForce * V.mouseRepelBoost;
+        Body.applyForce(b, b.position, { x: mdx * s, y: mdy * s });
       }
 
-      // rare impulses (events)
+      // rare impulses
       const chance = cfg.impulseChance * st.impulse;
       if (Math.random() < chance) {
         Body.applyForce(b, b.position, {
@@ -501,19 +466,16 @@ export function createPhysicsLayer(
         Body.setAngularVelocity(b, b.angularVelocity + (Math.random() - 0.5) * 0.30);
       }
 
-      // per-body damping
       b.frictionAir = clamp(cfg.frictionAir * (0.80 + st.massBias * 0.30), 0.007, 0.032);
 
       applyCompositionForces(b);
     }
   }
 
-  // Fixed-step physics
   let acc = 0;
   const fixed = 1 / 60;
 
-  function draw() {
-    // trails (cinematic)
+  function draw(t: number) {
     if (!cfg.trails) g.clearRect(0, 0, w, h);
     else {
       g.fillStyle = `rgba(0,0,0,${cfg.trailFade})`;
@@ -522,78 +484,108 @@ export function createPhysicsLayer(
 
     const pal = palette(mood, mode);
 
-    // Glow pass (additive)
+    // moving light direction (makes shapes feel "real")
+    const lx = Math.cos(t * 0.22) * 0.8 + 0.2;
+    const ly = Math.sin(t * 0.18) * 0.8 - 0.2;
+
+    // under-shadow (cheap, realistic depth)
+    for (const b of bodies) {
+      const x = b.position.x;
+      const y = b.position.y;
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
+
+      const sx = x + lx * r * 0.55;
+      const sy = y + ly * r * 0.55;
+
+      const sh = g.createRadialGradient(sx, sy, r * 0.3, sx, sy, r * 2.2);
+      sh.addColorStop(0, `rgba(0,0,0,${V.shadowA})`);
+      sh.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = sh;
+      g.beginPath();
+      g.arc(sx, sy, r * 2.2, 0, TAU);
+      g.fill();
+    }
+
+    // glow pass (additive)
     g.save();
     g.globalCompositeOperation = "lighter";
     for (const b of bodies) {
       const st = (b as any)._style as { tint: number };
       const x = b.position.x;
       const y = b.position.y;
-      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 20);
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
-      const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.2);
+      const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.0);
       grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${V.glowA * st.tint})`);
       grad.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},0.0)`);
       g.fillStyle = grad;
       g.beginPath();
-      g.arc(x, y, r * 3.2, 0, TAU);
+      g.arc(x, y, r * 3.0, 0, TAU);
       g.fill();
     }
     g.restore();
 
-    // Glass bodies (precise, clean)
+    // main “real” glass bodies
     for (const b of bodies) {
       const st = (b as any)._style as { tint: number; bias: number };
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
 
-      const baseA = mode === "MONO" ? (0.030 + 0.012 * st.tint) : (0.038 + 0.020 * st.tint);
-      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 20);
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
-      // velocity-based highlight (feels “alive”)
+      // speed -> more specular (looks alive)
       const vx = (b.velocity?.x ?? 0);
       const vy = (b.velocity?.y ?? 0);
       const speed = Math.sqrt(vx * vx + vy * vy);
-      const hi = clamp(0.06 + speed * 0.015, 0.06, 0.14);
+      const spec = clamp(0.08 + speed * 0.018, 0.08, V.specular);
 
       g.save();
       g.translate(x, y);
       g.rotate(angle);
 
+      // shape path
       const verts = b.vertices;
       g.beginPath();
       g.moveTo(verts[0].x - x, verts[0].y - y);
       for (let i = 1; i < verts.length; i++) g.lineTo(verts[i].x - x, verts[i].y - y);
       g.closePath();
 
+      // body fill gradient (realistic glass)
       const lg = g.createLinearGradient(-r, -r, r, r);
+      const baseA = mode === "MONO" ? (0.030 + 0.012 * st.tint) : (0.036 + 0.020 * st.tint);
       lg.addColorStop(0, `rgba(255,255,255,${baseA})`);
       lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${V.glassFill * st.tint})`);
       g.fillStyle = lg;
       g.fill();
 
-      // outer stroke
+      // outer edge
       g.strokeStyle = `rgba(255,255,255,${V.glassStroke})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // inner line (precision / detail)
-      g.strokeStyle = `rgba(255,255,255,${V.innerLine})`;
+      // Fresnel rim (fake but looks real)
+      g.strokeStyle = `rgba(255,255,255,${V.fresnel})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // specular highlight (animated direction via bias)
-      g.strokeStyle = `rgba(255,255,255,${Math.max(V.highlight, hi)})`;
+      // specular line (light direction + per-body bias)
+      g.strokeStyle = `rgba(255,255,255,${spec})`;
       g.beginPath();
-      g.moveTo(-r * (0.70 - st.bias * 0.15), -r * 0.55);
-      g.lineTo(r * (0.12 + st.bias * 0.10), -r * (0.95 - st.bias * 0.08));
+      g.moveTo(-r * (0.72 - st.bias * 0.12), -r * 0.55);
+      g.lineTo(r * (0.18 + st.bias * 0.10), -r * (0.95 - st.bias * 0.08));
       g.stroke();
+
+      // specular glint dot
+      g.fillStyle = `rgba(255,255,255,${spec * 0.65})`;
+      g.beginPath();
+      g.arc(-r * 0.20, -r * 0.40, 1.2, 0, TAU);
+      g.fill();
 
       // micro sparkle
       if (Math.random() < V.sparkleChance) {
-        g.fillStyle = "rgba(255,255,255,0.12)";
-        g.fillRect(-r * 0.16, -r * 0.06, 1.5, 1.5);
+        g.fillStyle = "rgba(255,255,255,0.11)";
+        g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
       }
 
       g.restore();
@@ -623,7 +615,6 @@ export function createPhysicsLayer(
       if (n === "ICE" || n === "NEON" || n === "VIOLET" || n === "MONO") mode = n;
     },
     setDensity: (count: number) => {
-      // now we allow very high density to fill screen
       const c = clamp(Math.round(count), 80, 220);
       if (c === cfg.count) return;
       cfg.count = c;
@@ -637,7 +628,7 @@ export function createPhysicsLayer(
         Engine.update(engine, fixed * 1000);
         acc -= fixed;
       }
-      draw();
+      draw(t);
     },
   };
 }
