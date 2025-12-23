@@ -6,7 +6,6 @@ body{
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
 }
 
-/* كل طبقات الخلفية */
 .bg-layer{
   position:fixed;
   inset:0;
@@ -16,12 +15,10 @@ body{
   pointer-events:none;
 }
 
-/* ترتيب الطبقات */
-#layer1 { z-index: 0; } /* WebGL (5 components interacting) */
-#layer2 { z-index: 1; } /* transparent squares grid */
-#layer3 { z-index: 2; } /* physics 2D objects */
+#layer1 { z-index: 0; }
+#layer2 { z-index: 1; mix-blend-mode: screen; opacity: 0.95; }
+#layer3 { z-index: 2; mix-blend-mode: screen; opacity: 0.98; }
 
-/* تحسين واقعية خفيفة فوق الكل */
 body::after{
   content:"";
   position:fixed;
@@ -35,5 +32,4 @@ body::after{
   opacity:.7;
 }
 
-/* الصفحة فاضية */
 #app{ position:relative; min-height:100vh; }
