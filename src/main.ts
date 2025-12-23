@@ -12,7 +12,7 @@ const CONFIG = {
     enabled: true,
     startDelayMs: 250,
     // base count is adaptive (see adapt())
-    count: 30,
+    count: 90,
     restitution: 0.92,
     frictionAir: 0.012,
     density: 0.001,
@@ -221,12 +221,10 @@ type PhysicsApi = {
 let physicsApi: PhysicsApi | null = null;
 
 function adaptiveCount(w: number, h: number) {
-  // Adaptive density for devices (iPad/mobile/desktop)
-  const area = (w * h) / 1_000_000; // in MP (device pixels)
-  // approx: 0.8MP => ~14, 2.5MP => ~22, 5MP => ~30
-  return clamp(Math.round(18 + area * 10), 24, 56);
+  const area = (w * h) / 1_000_000; // device pixels -> MP
+  // Fill-screen: mobile ~95, iPad ~140-165, desktop ~170-190
+  return clamp(Math.round(70 + area * 35), 90, 190);
 }
-
 async function initPhysics() {
   if (!CONFIG.physics.enabled || CONFIG.reducedMotion) return;
 

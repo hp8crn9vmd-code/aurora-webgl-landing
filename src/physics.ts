@@ -29,16 +29,17 @@ function rand01(seed: number) {
 }
 
 function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
+  // divergence-free flow (smooth, non-repeating, feels alive)
   const e = 0.75;
-  const n1 = noise2(x + e + t * 0.25, y);
-  const n2 = noise2(x - e + t * 0.25, y);
-  const n3 = noise2(x, y + e + t * 0.25);
-  const n4 = noise2(x, y - e + t * 0.25);
+  const n1 = noise2(x + e + t * 0.22, y);
+  const n2 = noise2(x - e + t * 0.22, y);
+  const n3 = noise2(x, y + e + t * 0.22);
+  const n4 = noise2(x, y - e + t * 0.22);
 
   const dx = (n1 - n2) / (2 * e);
   const dy = (n3 - n4) / (2 * e);
 
-  return { x: dy, y: -dx }; // divergence-free flow
+  return { x: dy, y: -dx };
 }
 
 type ModeName = "ICE" | "NEON" | "VIOLET" | "MONO";
@@ -49,10 +50,16 @@ function palette(mood: number, mode: ModeName) {
   return { r: 215, g: 190, b: 255 };
 }
 
-// ---- Spatial Hash (anti-cluster without O(n^2)) ----
+// Spatial Hash (anti-cluster)
 type CellKey = string;
-function cellKey(ix: number, iy: number): CellKey {
-  return `${ix},${iy}`;
+const cellKey = (ix: number, iy: number): CellKey => `${ix},${iy}`;
+
+// Fisher-Yates shuffle
+function shuffleInPlace<T>(a: T[]) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = (Math.random() * (i + 1)) | 0;
+    [a[i], a[j]] = [a[j], a[i]];
+  }
 }
 
 export function createPhysicsLayer(
@@ -82,33 +89,46 @@ export function createPhysicsLayer(
   let mood = 0;
   let mode: ModeName = "ICE";
 
-  // Art knobs
+  // Premium art knobs
   const V = {
-    glowA: 0.085,
-    glassFill: 0.060,
-    glassStroke: 0.11,
-    highlight: 0.095,
-    sparkleChance: 0.055,
+    // visual
+    glowA: 0.090,
+    glassFill: 0.062,
+    glassStroke: 0.115,
+    innerLine: 0.060,
+    highlight: 0.10,
+    sparkleChance: 0.070,
 
     // composition
-    centerForce: 0.000004,
-    edgeRepel: 0.000010,
+    centerForce: 0.0000035,
+    edgeRepel: 0.000012,
 
-    // anti-cluster (spatial hash)
-    cellSize: 140,          // bigger => cheaper, still effective
-    repelRadius: 130,       // local repulsion radius
-    repelForce: 0.000022,   // strength of anti-cluster
+    // anti-cluster (local repulsion)
+    cellSize: 110,
+    repelRadius: 95,
+    repelForce: 0.000030,
 
-    // magnets
-    magnetCount: 3,
-    magnetForce: 0.000070,  // base magnet strength
-    magnetRadius: 520,      // range
-    magnetWobble: 0.16,     // motion speed
+    // magnets / force field
+    magnetCount: 4,
+    magnetForce: 0.000075,
+    magnetRadius: 560,
+    magnetWobble: 0.18,
+
+    // micro-springs (local living tissue feeling)
+    springStiffness: 0.0022,
+    springDamping: 0.14,
+    springLenMin: 40,
+    springLenMax: 120,
+    springPerBody: 1, // keep perf with many bodies
+    maxSprings: 220,
+
+    // spawn distribution
+    spawnPadding: 32,
   } as const;
 
   function rebuildBounds() {
     bounds.forEach((b) => Composite.remove(world, b));
-    const thick = 140;
+    const thick = 160;
     bounds = [
       Bodies.rectangle(w / 2, -thick / 2, w + thick * 2, thick, { isStatic: true, render: { visible: false } }),
       Bodies.rectangle(w / 2, h + thick / 2, w + thick * 2, thick, { isStatic: true, render: { visible: false } }),
@@ -118,11 +138,57 @@ export function createPhysicsLayer(
     Composite.add(world, bounds);
   }
 
-  function makeBody(i: number) {
-    const x = Math.random() * w;
-    const y = Math.random() * h;
+  // Blue-noise-ish spawn: jittered grid + shuffle (prevents initial clustering)
+  function spawnPoints(count: number) {
+    const pts: { x: number; y: number }[] = [];
+    const pad = V.spawnPadding;
 
-    const base = 10 + Math.random() * 18;
+    const W = Math.max(1, w - pad * 2);
+    const H = Math.max(1, h - pad * 2);
+    const aspect = W / Math.max(H, 1);
+
+    const cols = Math.max(8, Math.round(Math.sqrt(count * aspect)));
+    const rows = Math.max(8, Math.round(count / cols));
+
+    const dx = W / cols;
+    const dy = H / rows;
+
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const x = pad + (i + 0.5) * dx + (Math.random() - 0.5) * dx * 0.70;
+        const y = pad + (j + 0.5) * dy + (Math.random() - 0.5) * dy * 0.70;
+        pts.push({ x: clamp(x, pad, w - pad), y: clamp(y, pad, h - pad) });
+      }
+    }
+
+    shuffleInPlace(pts);
+    return pts.slice(0, count);
+  }
+
+  function makeCapsule(x: number, y: number, length: number, radius: number, common: any) {
+    // compound body: rect + 2 circles (professional "capsule" shape)
+    const rect = Bodies.rectangle(x, y, Math.max(8, length), Math.max(6, radius * 2), {
+      ...common,
+      chamfer: { radius: radius * 0.85 },
+    });
+    const c1 = Bodies.circle(x - length * 0.5, y, radius, common);
+    const c2 = Bodies.circle(x + length * 0.5, y, radius, common);
+
+    const body = Body.create({
+      parts: [rect, c1, c2],
+      restitution: common.restitution,
+      frictionAir: common.frictionAir,
+      density: common.density,
+    });
+    return body;
+  }
+
+  function makeBody(i: number, pt: { x: number; y: number }) {
+    const x = pt.x;
+    const y = pt.y;
+
+    // smaller sizes to allow “full screen filled”
+    const base = 6 + Math.random() * 10; // 6..16
     const kind = Math.random();
 
     const common = {
@@ -132,37 +198,56 @@ export function createPhysicsLayer(
     };
 
     let b: Matter.Body;
-    if (kind < 0.40) {
-      b = Bodies.circle(x, y, base * 0.95, common);
-    } else if (kind < 0.72) {
+
+    // A) circle glass beads
+    if (kind < 0.34) {
+      b = Bodies.circle(x, y, base * (0.85 + Math.random() * 0.25), common);
+
+      // B) rounded rectangles (glass tiles)
+    } else if (kind < 0.62) {
       b = Bodies.rectangle(
         x,
         y,
-        base * (1.8 + Math.random() * 1.2),
-        base * (1.0 + Math.random() * 0.8),
-        { ...common, chamfer: { radius: base * (0.35 + Math.random() * 0.25) } },
+        base * (1.8 + Math.random() * 1.6),
+        base * (1.0 + Math.random() * 1.2),
+        {
+          ...common,
+          chamfer: { radius: base * (0.45 + Math.random() * 0.25) },
+        },
       );
-    } else {
-      const sides = 3 + Math.floor(Math.random() * 5);
-      b = Bodies.polygon(x, y, sides, base * 1.1, {
+
+      // C) rounded polygons (crystals)
+    } else if (kind < 0.84) {
+      const sides = 3 + Math.floor(Math.random() * 6); // 3..8
+      b = Bodies.polygon(x, y, sides, base * (1.0 + Math.random() * 0.6), {
         ...common,
-        chamfer: { radius: base * (0.25 + Math.random() * 0.30) },
+        chamfer: { radius: base * (0.30 + Math.random() * 0.30) },
       });
+
+      // D) capsules (premium, dynamic)
+    } else {
+      const len = base * (2.2 + Math.random() * 2.2);
+      const rad = base * (0.55 + Math.random() * 0.25);
+      b = makeCapsule(x, y, len, rad, common);
     }
 
-    // per-body "character"
-    const polarity = rand01(i * 19.7) < 0.5 ? -1 : 1; // half attract, half repel (magnet-like)
+    const polarity = rand01(i * 19.7) < 0.5 ? -1 : 1;
+
     (b as any)._style = {
-      tint: rand01(i * 33.7) * 0.35 + 0.35,
+      tint: rand01(i * 33.7) * 0.45 + 0.25,
       massBias: rand01(i * 12.2) * 0.8 + 0.6,
-      flow: rand01(i * 66.6) * 1.6 + 0.5,
+      flow: rand01(i * 66.6) * 1.7 + 0.4,
       impulse: rand01(i * 88.8) * 1.2 + 0.4,
       polarity,
       seed: Math.random() * 1e6,
+      // visual identity
+      bias: rand01(i * 111.1),
     };
 
-    Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.10);
-    Body.setVelocity(b, { x: (Math.random() - 0.5) * 2.8, y: (Math.random() - 0.5) * 2.8 });
+    // give initial motion (subtle but alive)
+    Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.12);
+    Body.setVelocity(b, { x: (Math.random() - 0.5) * 2.0, y: (Math.random() - 0.5) * 2.0 });
+
     return b;
   }
 
@@ -173,58 +258,84 @@ export function createPhysicsLayer(
     constraints = [];
   }
 
-  function buildConstraints() {
-    // keep constraints lighter as count grows (still artistic)
-    const clusters = 3;
-    const per = Math.max(6, Math.floor(cfg.count / clusters));
+  function buildSpatialGrid(cs: number) {
+    const grid = new Map<CellKey, Matter.Body[]>();
+    for (const b of bodies) {
+      const ix = Math.floor(b.position.x / cs);
+      const iy = Math.floor(b.position.y / cs);
+      const k = cellKey(ix, iy);
+      const arr = grid.get(k);
+      if (arr) arr.push(b);
+      else grid.set(k, [b]);
+    }
+    return grid;
+  }
 
-    for (let c = 0; c < clusters; c++) {
-      const start = c * per;
-      const end = Math.min(cfg.count, start + per);
-      const group = bodies.slice(start, end);
-      if (group.length < 3) continue;
+  function addMicroSprings() {
+    // connect each body to a neighbor in nearby cells (local “living tissue”)
+    const cs = V.cellSize;
+    const grid = buildSpatialGrid(cs);
 
-      const hub = group[Math.floor(Math.random() * group.length)];
-      for (const b of group) {
-        if (b === hub) continue;
+    let added = 0;
+
+    for (const b of bodies) {
+      if (added >= V.maxSprings) break;
+
+      const ix = Math.floor(b.position.x / cs);
+      const iy = Math.floor(b.position.y / cs);
+
+      // find candidates in neighbor cells
+      const candidates: Matter.Body[] = [];
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const arr = grid.get(cellKey(ix + ox, iy + oy));
+          if (arr) candidates.push(...arr);
+        }
+      }
+
+      if (candidates.length < 2) continue;
+
+      // pick one or two random neighbors (exclude self)
+      for (let k = 0; k < V.springPerBody; k++) {
+        if (added >= V.maxSprings) break;
+
+        const other = candidates[(Math.random() * candidates.length) | 0];
+        if (other === b) continue;
+
+        const dx = other.position.x - b.position.x;
+        const dy = other.position.y - b.position.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+
+        // keep only local links
+        if (d < V.springLenMin || d > V.springLenMax) continue;
+
         constraints.push(
           Constraint.create({
-            bodyA: hub,
-            bodyB: b,
-            stiffness: lerp(0.0020, 0.0064, Math.random()),
-            damping: lerp(0.08, 0.18, Math.random()),
-            length: lerp(60, 230, Math.random()),
+            bodyA: b,
+            bodyB: other,
+            stiffness: V.springStiffness * (0.7 + Math.random() * 0.6),
+            damping: V.springDamping,
+            length: d,
             render: { visible: false },
           }),
         );
+        added++;
       }
     }
 
-    const cross = Math.floor(cfg.count * cfg.constraintRatio);
-    for (let i = 0; i < cross; i++) {
-      const a = bodies[Math.floor(Math.random() * bodies.length)];
-      const b = bodies[Math.floor(Math.random() * bodies.length)];
-      if (a === b) continue;
-      constraints.push(
-        Constraint.create({
-          bodyA: a,
-          bodyB: b,
-          stiffness: lerp(0.0016, 0.0040, Math.random()),
-          damping: lerp(0.08, 0.18, Math.random()),
-          length: lerp(90, 280, Math.random()),
-          render: { visible: false },
-        }),
-      );
-    }
-
-    Composite.add(world, constraints);
+    if (constraints.length) Composite.add(world, constraints);
   }
 
   function rebuildBodies() {
     clearAll();
-    for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i));
+
+    const pts = spawnPoints(cfg.count);
+    for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i, pts[i % pts.length]));
+
     Composite.add(world, bodies);
-    buildConstraints();
+
+    // constraints ratio scaled down when huge counts (keep perf)
+    addMicroSprings();
   }
 
   function applyCompositionForces(b: Matter.Body) {
@@ -235,7 +346,7 @@ export function createPhysicsLayer(
     const dyC = (cy - b.position.y) / Math.max(h, 1);
     Body.applyForce(b, b.position, { x: dxC * V.centerForce, y: dyC * V.centerForce });
 
-    const margin = 120;
+    const margin = 110;
     const left = margin - b.position.x;
     const right = b.position.x - (w - margin);
     const top = margin - b.position.y;
@@ -247,37 +358,32 @@ export function createPhysicsLayer(
     if (bottom > 0) Body.applyForce(b, b.position, { x: 0, y: -V.edgeRepel * (bottom / margin) });
   }
 
-  // magnets: moving attractors with polarity that slowly drifts (very “alive”)
   function magnetPositions(t: number) {
     const mags: { x: number; y: number; pol: number }[] = [];
-    const a = Math.min(w, h) * 0.28;
+    const a = Math.min(w, h) * 0.33;
     const cx = w * 0.5;
     const cy = h * 0.5;
 
     for (let i = 0; i < V.magnetCount; i++) {
       const ph = i * 2.1;
-      const x = cx + a * Math.sin(t * (0.22 + V.magnetWobble * 0.10) + ph) + a * 0.45 * Math.sin(t * 0.11 + ph * 1.7);
-      const y = cy + a * Math.cos(t * (0.19 + V.magnetWobble * 0.12) + ph) + a * 0.35 * Math.cos(t * 0.13 + ph * 1.3);
-      // polarity flips softly via noise/time
-      const pol = (Math.sin(t * 0.25 + ph) + (rand01(i * 91.7) - 0.5) * 0.2) >= 0 ? 1 : -1;
+      const x =
+        cx +
+        a * Math.sin(t * (0.20 + V.magnetWobble * 0.10) + ph) +
+        a * 0.52 * Math.sin(t * 0.11 + ph * 1.7);
+      const y =
+        cy +
+        a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) +
+        a * 0.42 * Math.cos(t * 0.13 + ph * 1.3);
+
+      const pol = Math.sin(t * 0.23 + ph) >= 0 ? 1 : -1;
       mags.push({ x, y, pol });
     }
     return mags;
   }
 
   function applyAntiClusterSpatialHash() {
-    // bucket bodies into grid cells, then local neighbor repulsion
     const cs = V.cellSize;
-    const grid = new Map<CellKey, Matter.Body[]>();
-
-    for (const b of bodies) {
-      const ix = Math.floor(b.position.x / cs);
-      const iy = Math.floor(b.position.y / cs);
-      const k = cellKey(ix, iy);
-      const arr = grid.get(k);
-      if (arr) arr.push(b);
-      else grid.set(k, [b]);
-    }
+    const grid = buildSpatialGrid(cs);
 
     const r = V.repelRadius;
     const r2 = r * r;
@@ -288,7 +394,6 @@ export function createPhysicsLayer(
 
       let near = 0;
 
-      // check this cell + 8 neighbors
       for (let oy = -1; oy <= 1; oy++) {
         for (let ox = -1; ox <= 1; ox++) {
           const arr = grid.get(cellKey(ix + ox, iy + oy));
@@ -302,20 +407,21 @@ export function createPhysicsLayer(
             if (d2 > 0.0001 && d2 < r2) {
               near++;
               const d = Math.sqrt(d2);
-              const s = (1 - d / r) * V.repelForce; // stronger when closer
+              const s = (1 - d / r) * V.repelForce;
               Body.applyForce(b, b.position, { x: (dx / d) * s, y: (dy / d) * s });
             }
           }
         }
       }
 
-      // if locally dense => extra gentle "explode" outward from center of screen
-      if (near >= 8) {
-        const cx = w * 0.5, cy = h * 0.5;
+      // local density burst (prevents blobs)
+      if (near >= 10) {
+        const cx = w * 0.5;
+        const cy = h * 0.5;
         const dx = b.position.x - cx;
         const dy = b.position.y - cy;
         const d = Math.sqrt(dx * dx + dy * dy) + 0.001;
-        Body.applyForce(b, b.position, { x: (dx / d) * 0.000010, y: (dy / d) * 0.000010 });
+        Body.applyForce(b, b.position, { x: (dx / d) * 0.000012, y: (dy / d) * 0.000012 });
       }
     }
   }
@@ -324,13 +430,13 @@ export function createPhysicsLayer(
     const wSafe = Math.max(w, 1);
     const hSafe = Math.max(h, 1);
 
-    // moving anchors (keeps scene coherent)
-    const ax = (0.5 + 0.15 * Math.sin(t * 0.17)) * wSafe;
-    const ay = (0.5 + 0.15 * Math.cos(t * 0.13)) * hSafe;
+    // drifting anchors: coherence
+    const ax = (0.5 + 0.16 * Math.sin(t * 0.17)) * wSafe;
+    const ay = (0.5 + 0.16 * Math.cos(t * 0.13)) * hSafe;
 
     const mags = magnetPositions(t);
 
-    // anti-cluster pass
+    // anti-cluster first
     applyAntiClusterSpatialHash();
 
     for (let i = 0; i < bodies.length; i++) {
@@ -342,6 +448,7 @@ export function createPhysicsLayer(
         tint: number;
         polarity: number;
         seed: number;
+        bias: number;
       };
 
       // curl flow field
@@ -350,36 +457,37 @@ export function createPhysicsLayer(
       const c = curlNoise(noise2, px, py, t);
 
       Body.applyForce(b, b.position, {
-        x: c.x * cfg.turbulence * 1.45 * st.flow,
-        y: c.y * cfg.turbulence * 1.45 * st.flow,
+        x: c.x * cfg.turbulence * 1.70 * st.flow,
+        y: c.y * cfg.turbulence * 1.70 * st.flow,
       });
 
-      // soft pull towards moving anchor
+      // super soft pull to moving anchor
       Body.applyForce(b, b.position, {
         x: ((ax - b.position.x) / wSafe) * 0.000003,
         y: ((ay - b.position.y) / hSafe) * 0.000003,
       });
 
-      // magnets (some attract, some repel => unpredictable)
+      // magnets: mixed polarity = unpredictable
+      const mr2 = V.magnetRadius * V.magnetRadius;
       for (const m of mags) {
         const dx = m.x - b.position.x;
         const dy = m.y - b.position.y;
         const d2 = dx * dx + dy * dy;
-        if (d2 < V.magnetRadius * V.magnetRadius) {
+        if (d2 < mr2) {
           const d = Math.sqrt(d2) + 0.001;
-          const falloff = (1 - d / V.magnetRadius);
-          const sign = st.polarity * m.pol; // +/- (magnet-like)
-          const strength = V.magnetForce * falloff * falloff * (0.75 + st.tint * 0.7);
+          const falloff = 1 - d / V.magnetRadius;
+          const sign = st.polarity * m.pol;
+          const strength = V.magnetForce * falloff * falloff * (0.70 + st.tint * 0.85);
           Body.applyForce(b, b.position, { x: (dx / d) * strength * sign, y: (dy / d) * strength * sign });
         }
       }
 
-      // mouse magnet (stronger, feels premium)
+      // mouse: premium "hand of god"
       const mdx = b.position.x / wSafe - mx;
       const mdy = b.position.y / hSafe - my;
       const md = Math.sqrt(mdx * mdx + mdy * mdy) * Math.max(wSafe, hSafe);
       if (md < cfg.mouseRadius) {
-        const s = (1 - md / cfg.mouseRadius) * cfg.mouseForce * 1.25;
+        const s = (1 - md / cfg.mouseRadius) * cfg.mouseForce * 1.30;
         Body.applyForce(b, b.position, { x: -mdx * s, y: -mdy * s });
       }
 
@@ -387,23 +495,25 @@ export function createPhysicsLayer(
       const chance = cfg.impulseChance * st.impulse;
       if (Math.random() < chance) {
         Body.applyForce(b, b.position, {
-          x: (Math.random() - 0.5) * cfg.impulseStrength * 1.10,
-          y: (Math.random() - 0.5) * cfg.impulseStrength * 1.10,
+          x: (Math.random() - 0.5) * cfg.impulseStrength * 1.12,
+          y: (Math.random() - 0.5) * cfg.impulseStrength * 1.12,
         });
         Body.setAngularVelocity(b, b.angularVelocity + (Math.random() - 0.5) * 0.30);
       }
 
       // per-body damping
-      b.frictionAir = clamp(cfg.frictionAir * (0.82 + st.massBias * 0.28), 0.007, 0.03);
+      b.frictionAir = clamp(cfg.frictionAir * (0.80 + st.massBias * 0.30), 0.007, 0.032);
 
       applyCompositionForces(b);
     }
   }
 
+  // Fixed-step physics
   let acc = 0;
   const fixed = 1 / 60;
 
   function draw() {
+    // trails (cinematic)
     if (!cfg.trails) g.clearRect(0, 0, w, h);
     else {
       g.fillStyle = `rgba(0,0,0,${cfg.trailFade})`;
@@ -412,34 +522,40 @@ export function createPhysicsLayer(
 
     const pal = palette(mood, mode);
 
-    // glow pass (additive)
+    // Glow pass (additive)
     g.save();
     g.globalCompositeOperation = "lighter";
     for (const b of bodies) {
       const st = (b as any)._style as { tint: number };
       const x = b.position.x;
       const y = b.position.y;
-      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 20);
 
-      const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.1);
+      const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.2);
       grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${V.glowA * st.tint})`);
       grad.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},0.0)`);
       g.fillStyle = grad;
       g.beginPath();
-      g.arc(x, y, r * 3.1, 0, TAU);
+      g.arc(x, y, r * 3.2, 0, TAU);
       g.fill();
     }
     g.restore();
 
-    // glass bodies
+    // Glass bodies (precise, clean)
     for (const b of bodies) {
-      const st = (b as any)._style as { tint: number };
+      const st = (b as any)._style as { tint: number; bias: number };
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
 
-      const baseA = mode === "MONO" ? (0.030 + 0.014 * st.tint) : (0.040 + 0.020 * st.tint);
-      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
+      const baseA = mode === "MONO" ? (0.030 + 0.012 * st.tint) : (0.038 + 0.020 * st.tint);
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 20);
+
+      // velocity-based highlight (feels “alive”)
+      const vx = (b.velocity?.x ?? 0);
+      const vy = (b.velocity?.y ?? 0);
+      const speed = Math.sqrt(vx * vx + vy * vy);
+      const hi = clamp(0.06 + speed * 0.015, 0.06, 0.14);
 
       g.save();
       g.translate(x, y);
@@ -457,19 +573,27 @@ export function createPhysicsLayer(
       g.fillStyle = lg;
       g.fill();
 
+      // outer stroke
       g.strokeStyle = `rgba(255,255,255,${V.glassStroke})`;
       g.lineWidth = 1;
       g.stroke();
 
-      g.strokeStyle = `rgba(255,255,255,${V.highlight})`;
-      g.beginPath();
-      g.moveTo(-r * 0.65, -r * 0.55);
-      g.lineTo(r * 0.15, -r * 0.95);
+      // inner line (precision / detail)
+      g.strokeStyle = `rgba(255,255,255,${V.innerLine})`;
+      g.lineWidth = 1;
       g.stroke();
 
+      // specular highlight (animated direction via bias)
+      g.strokeStyle = `rgba(255,255,255,${Math.max(V.highlight, hi)})`;
+      g.beginPath();
+      g.moveTo(-r * (0.70 - st.bias * 0.15), -r * 0.55);
+      g.lineTo(r * (0.12 + st.bias * 0.10), -r * (0.95 - st.bias * 0.08));
+      g.stroke();
+
+      // micro sparkle
       if (Math.random() < V.sparkleChance) {
         g.fillStyle = "rgba(255,255,255,0.12)";
-        g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
+        g.fillRect(-r * 0.16, -r * 0.06, 1.5, 1.5);
       }
 
       g.restore();
@@ -499,15 +623,15 @@ export function createPhysicsLayer(
       if (n === "ICE" || n === "NEON" || n === "VIOLET" || n === "MONO") mode = n;
     },
     setDensity: (count: number) => {
-      // allow more objects now
-      const c = clamp(Math.round(count), 18, 72);
+      // now we allow very high density to fill screen
+      const c = clamp(Math.round(count), 80, 220);
       if (c === cfg.count) return;
       cfg.count = c;
       rebuildBodies();
     },
     step: (t: number, dt: number) => {
       acc += dt;
-      acc = Math.min(acc, 0.22);
+      acc = Math.min(acc, 0.24);
       while (acc >= fixed) {
         applyForces(t);
         Engine.update(engine, fixed * 1000);
