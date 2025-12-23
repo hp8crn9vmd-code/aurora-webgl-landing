@@ -1,47 +1,55 @@
 precision highp float;
 
 varying vec2 vUv;
-uniform vec2 uResolution;
+uniform vec2  uResolution;
 uniform float uTime;
-uniform vec2 uMouse;
+uniform vec2  uMouse;
 uniform float uMotion; // 0..1
 
-// hash/noise
-float hash12(vec2 p){
-  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-  p3 += dot(p3, p3.yzx + 33.33);
-  return fract((p3.x + p3.y) * p3.z);
+// ---- Hash / Noise (vec3) ----
+float hash13(vec3 p){
+  p = fract(p * 0.1031);
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
 }
 
-float noise(vec2 p){
-  vec2 i = floor(p);
-  vec2 f = fract(p);
-  float a = hash12(i);
-  float b = hash12(i + vec2(1.0, 0.0));
-  float c = hash12(i + vec2(0.0, 1.0));
-  float d = hash12(i + vec2(1.0, 1.0));
-  vec2 u = f*f*(3.0 - 2.0*f);
-  return mix(a, b, u.x) + (c - a)*u.y*(1.0 - u.x) + (d - b)*u.x*u.y;
+float noise3(vec3 p){
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f*f*(3.0 - 2.0*f);
+
+  float n000 = hash13(i + vec3(0,0,0));
+  float n100 = hash13(i + vec3(1,0,0));
+  float n010 = hash13(i + vec3(0,1,0));
+  float n110 = hash13(i + vec3(1,1,0));
+  float n001 = hash13(i + vec3(0,0,1));
+  float n101 = hash13(i + vec3(1,0,1));
+  float n011 = hash13(i + vec3(0,1,1));
+  float n111 = hash13(i + vec3(1,1,1));
+
+  float nx00 = mix(n000, n100, f.x);
+  float nx10 = mix(n010, n110, f.x);
+  float nx01 = mix(n001, n101, f.x);
+  float nx11 = mix(n011, n111, f.x);
+
+  float nxy0 = mix(nx00, nx10, f.y);
+  float nxy1 = mix(nx01, nx11, f.y);
+
+  return mix(nxy0, nxy1, f.z);
 }
 
-mat2 rot(float a){
-  float s = sin(a), c = cos(a);
-  return mat2(c,-s,s,c);
-}
-
-float fbm(vec2 p){
+float fbm3(vec3 p){
   float v = 0.0;
   float a = 0.55;
-  mat2 m = rot(0.5) * mat2(1.6, 1.2, -1.2, 1.6);
-  for(int i=0;i<6;i++){
-    v += a * noise(p);
-    p = m * p;
+  for(int i=0;i<5;i++){
+    v += a * noise3(p);
+    p = p * 2.02 + vec3(17.0, 11.0, 5.0);
     a *= 0.5;
   }
   return v;
 }
 
-// ACES-ish tonemap
+// ---- Tonemap / Output ----
 vec3 acesTonemap(vec3 x){
   const float a = 2.51;
   const float b = 0.03;
@@ -52,66 +60,92 @@ vec3 acesTonemap(vec3 x){
 }
 
 float ign(vec2 uv){
+  // interleaved gradient noise for dithering
   return fract(52.9829189 * fract(0.06711056 * uv.x + 0.00583715 * uv.y));
+}
+
+// ---- Volumetric field ----
+float densityField(vec3 p, float t){
+  // “Fog volume” with slow evolution (no object motion)
+  float d = fbm3(p * 0.85 + vec3(0.0, 0.0, t));
+  d = smoothstep(0.45, 0.82, d);
+  return d;
 }
 
 void main(){
   vec2 uv = vUv;
-
-  // aspect-correct coords
   vec2 p = (uv * uResolution - 0.5 * uResolution) / min(uResolution.x, uResolution.y);
 
-  // VERY subtle parallax (not object-like)
+  // camera setup (subtle mouse rotation, still volumetric)
   vec2 m = (uMouse / uResolution) - 0.5;
-  p += m * 0.03;
+  float yaw   = m.x * 0.35;
+  float pitch = m.y * 0.25;
 
-  float t = uTime * 0.08 * max(uMotion, 0.0); // slow motion
+  float t = uTime * 0.10 * uMotion; // very slow
 
-  // Flow field (soft, no bands/objects)
-  vec2 q = p;
-  q += vec2(
-    fbm(p * 0.45 + vec2( 0.0,  t)),
-    fbm(p * 0.45 + vec2( t,  0.0))
-  ) * 0.35;
+  // Ray origin & direction in a simple camera space
+  vec3 ro = vec3(0.0, 0.0, -2.8);
+  vec3 rd = normalize(vec3(p.x, p.y, 1.6));
 
-  // Second warp for extra smoothness
-  vec2 r = q;
-  r += vec2(
-    fbm(q * 0.70 - vec2(t * 0.7, t * 0.2)),
-    fbm(q * 0.70 + vec2(t * 0.2, t * 0.7))
-  ) * 0.25;
+  // Apply yaw/pitch
+  float cy = cos(yaw),  sy = sin(yaw);
+  float cp = cos(pitch),sp = sin(pitch);
+  mat3 Ry = mat3(cy,0.0,sy,  0.0,1.0,0.0,  -sy,0.0,cy);
+  mat3 Rx = mat3(1.0,0.0,0.0,  0.0,cp,-sp,  0.0,sp,cp);
+  rd = Ry * Rx * rd;
 
-  float n = fbm(r * 1.05);
+  // Lighting direction
+  vec3 lightDir = normalize(vec3(0.6, 0.4, 0.7));
 
-  // Premium palette (no aurora look)
-  vec3 c0 = vec3(0.02, 0.03, 0.06); // deep navy
-  vec3 c1 = vec3(0.07, 0.10, 0.16); // slate
-  vec3 c2 = vec3(0.10, 0.20, 0.24); // teal-gray
-  vec3 c3 = vec3(0.20, 0.12, 0.26); // muted purple
+  // Volumetric raymarch
+  vec3 col = vec3(0.0);
+  float trans = 1.0;
 
-  // Smooth mesh-like mixing
-  float w1 = smoothstep(0.15, 0.60, n);
-  float w2 = smoothstep(0.40, 0.85, n);
-  vec3 col = mix(c0, c1, w1);
-  col = mix(col, c2, w2);
+  // Background base
+  vec3 bgA = vec3(0.02, 0.03, 0.06);
+  vec3 bgB = vec3(0.04, 0.06, 0.10);
+  col += mix(bgA, bgB, smoothstep(-0.7, 0.9, p.y)) * 0.35;
 
-  // Add a gentle vertical studio light
-  float light = smoothstep(-0.8, 0.9, p.y) * 0.25;
-  col += vec3(0.06, 0.08, 0.10) * light;
+  float stepSize = 0.08;
+  float maxDist = 5.0;
+  float dist = 0.0;
 
-  // Subtle “lens warmth” in one corner (still not an object)
-  float corner = smoothstep(1.2, 0.0, length(p - vec2(0.55, 0.35)));
-  col = mix(col, col + c3 * 0.35, corner * 0.65);
+  for(int i=0;i<56;i++){
+    if(dist > maxDist || trans < 0.02) break;
 
-  // Cinematic vignette
-  float vig = smoothstep(1.25, 0.15, length(p));
+    vec3 pos = ro + rd * dist;
+
+    // Move volume slowly in Z for “breathing” depth (not objects)
+    vec3 q = pos + vec3(0.0, 0.0, t * 0.8);
+
+    float d = densityField(q, t);
+
+    // soft falloff to keep center richer
+    float fall = smoothstep(3.8, 0.6, length(pos));
+    d *= fall;
+
+    // fake single scattering
+    float ndl = clamp(dot(lightDir, rd) * 0.5 + 0.5, 0.0, 1.0);
+    vec3 fogColor = mix(vec3(0.07, 0.12, 0.22), vec3(0.12, 0.30, 0.40), ndl);
+
+    float alpha = d * 0.12;          // absorption
+    vec3  emit  = fogColor * (d * (0.35 + 0.65 * ndl));
+
+    col += trans * emit;
+    trans *= (1.0 - alpha);
+
+    dist += stepSize;
+  }
+
+  // Vignette (cinematic)
+  float vig = smoothstep(1.25, 0.20, length(p));
   col *= (0.70 + 0.55 * vig);
 
-  // Film grain + temporal dither (reduces banding)
+  // Dither/grain to reduce banding
   float g = ign(uv * uResolution.xy + fract(uTime)) - 0.5;
-  col += g * 0.030;
+  col += g * 0.025;
 
-  // Tonemap + gamma to sRGB-ish output
+  // Tonemap + gamma
   col = acesTonemap(col);
   col = pow(col, vec3(1.0/2.2));
 
