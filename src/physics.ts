@@ -1,6 +1,8 @@
 import Matter from "matter-js";
 
 export type PhysicsConfig = {
+  enabled?: boolean;
+  startDelayMs?: number;
   count: number;
   restitution: number;
   frictionAir: number;
@@ -39,16 +41,14 @@ function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
   return { x: dy, y: -dx };
 }
 
-// mood palettes (cool -> neon -> violet -> ice)
-function palette(mood: number) {
-  // 0..1
-  if (mood < 0.33) {
-    return { r: 190, g: 225, b: 255 }; // ice blue
-  } else if (mood < 0.66) {
-    return { r: 175, g: 255, b: 235 }; // neon mint
-  } else {
-    return { r: 215, g: 190, b: 255 }; // soft violet
-  }
+type ModeName = "ICE" | "NEON" | "VIOLET" | "MONO";
+
+function palette(mood: number, mode: ModeName) {
+  if (mode === "MONO") return { r: 235, g: 240, b: 255 };
+
+  if (mood < 0.33) return { r: 190, g: 225, b: 255 };
+  if (mood < 0.66) return { r: 175, g: 255, b: 235 };
+  return { r: 215, g: 190, b: 255 };
 }
 
 export function createPhysicsLayer(
@@ -75,19 +75,16 @@ export function createPhysicsLayer(
   let mx = 0.5;
   let my = 0.5;
 
-  // art director state
-  let mood = 0; // 0..1
+  let mood = 0;
+  let mode: ModeName = "ICE";
 
   const V = {
     glowA: 0.085,
-    glowB: 0.020,
     glassFill: 0.060,
     glassStroke: 0.11,
     highlight: 0.095,
     sparkleChance: 0.055,
-
-    // composition
-    centerForce: 0.000004, // prevent “stuck in corners”
+    centerForce: 0.000004,
     edgeRepel: 0.000010,
   } as const;
 
@@ -117,14 +114,16 @@ export function createPhysicsLayer(
     };
 
     let b: Matter.Body;
-
     if (kind < 0.40) {
       b = Bodies.circle(x, y, base * 0.95, common);
     } else if (kind < 0.72) {
-      b = Bodies.rectangle(x, y, base * (1.8 + Math.random() * 1.2), base * (1.0 + Math.random() * 0.8), {
-        ...common,
-        chamfer: { radius: base * (0.35 + Math.random() * 0.25) },
-      });
+      b = Bodies.rectangle(
+        x,
+        y,
+        base * (1.8 + Math.random() * 1.2),
+        base * (1.0 + Math.random() * 0.8),
+        { ...common, chamfer: { radius: base * (0.35 + Math.random() * 0.25) } },
+      );
     } else {
       const sides = 3 + Math.floor(Math.random() * 5);
       b = Bodies.polygon(x, y, sides, base * 1.1, {
@@ -133,9 +132,7 @@ export function createPhysicsLayer(
       });
     }
 
-    (b as any)._seed = Math.random() * 1e9;
     (b as any)._style = {
-      hue: rand01(i * 97.1) * 60 + 190,
       tint: rand01(i * 33.7) * 0.35 + 0.35,
       massBias: rand01(i * 12.2) * 0.8 + 0.6,
       flow: rand01(i * 66.6) * 1.4 + 0.6,
@@ -144,20 +141,20 @@ export function createPhysicsLayer(
 
     Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.10);
     Body.setVelocity(b, { x: (Math.random() - 0.5) * 2.6, y: (Math.random() - 0.5) * 2.6 });
-
     return b;
   }
 
-  function rebuildBodies() {
+  function clearAll() {
     bodies.forEach((b) => Composite.remove(world, b));
     constraints.forEach((c) => Composite.remove(world, c));
     bodies = [];
     constraints = [];
+  }
 
-    for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i));
-
+  function buildConstraints() {
     const clusters = 3;
     const per = Math.max(6, Math.floor(cfg.count / clusters));
+
     for (let c = 0; c < clusters; c++) {
       const start = c * per;
       const end = Math.min(cfg.count, start + per);
@@ -211,26 +208,29 @@ export function createPhysicsLayer(
         }),
       );
     }
-
-    Composite.add(world, bodies);
     Composite.add(world, constraints);
+  }
+
+  function rebuildBodies() {
+    clearAll();
+    for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i));
+    Composite.add(world, bodies);
+    buildConstraints();
   }
 
   function applyCompositionForces(b: Matter.Body) {
     const cx = w * 0.5;
     const cy = h * 0.5;
 
-    // keep composition centered (very soft)
     const dxC = (cx - b.position.x) / Math.max(w, 1);
     const dyC = (cy - b.position.y) / Math.max(h, 1);
     Body.applyForce(b, b.position, { x: dxC * V.centerForce, y: dyC * V.centerForce });
 
-    // repel from edges to avoid corner clustering
     const margin = 120;
-    const left = (margin - b.position.x);
-    const right = (b.position.x - (w - margin));
-    const top = (margin - b.position.y);
-    const bottom = (b.position.y - (h - margin));
+    const left = margin - b.position.x;
+    const right = b.position.x - (w - margin);
+    const top = margin - b.position.y;
+    const bottom = b.position.y - (h - margin);
 
     if (left > 0) Body.applyForce(b, b.position, { x: V.edgeRepel * (left / margin), y: 0 });
     if (right > 0) Body.applyForce(b, b.position, { x: -V.edgeRepel * (right / margin), y: 0 });
@@ -253,13 +253,15 @@ export function createPhysicsLayer(
       const py = b.position.y * 0.004;
 
       const c = curlNoise(noise2, px, py, t);
-      const fx = c.x * cfg.turbulence * 1.25 * st.flow;
-      const fy = c.y * cfg.turbulence * 1.25 * st.flow;
-      Body.applyForce(b, b.position, { x: fx, y: fy });
+      Body.applyForce(b, b.position, {
+        x: c.x * cfg.turbulence * 1.25 * st.flow,
+        y: c.y * cfg.turbulence * 1.25 * st.flow,
+      });
 
-      const dxA = (ax - b.position.x) / wSafe;
-      const dyA = (ay - b.position.y) / hSafe;
-      Body.applyForce(b, b.position, { x: dxA * 0.000003, y: dyA * 0.000003 });
+      Body.applyForce(b, b.position, {
+        x: ((ax - b.position.x) / wSafe) * 0.000003,
+        y: ((ay - b.position.y) / hSafe) * 0.000003,
+      });
 
       const dx = b.position.x / wSafe - mx;
       const dy = b.position.y / hSafe - my;
@@ -284,21 +286,18 @@ export function createPhysicsLayer(
     }
   }
 
-  // fixed-step stability
   let acc = 0;
   const fixed = 1 / 60;
 
-  function draw(t: number) {
-    if (!cfg.trails) {
-      g.clearRect(0, 0, w, h);
-    } else {
+  function draw() {
+    if (!cfg.trails) g.clearRect(0, 0, w, h);
+    else {
       g.fillStyle = `rgba(0,0,0,${cfg.trailFade})`;
       g.fillRect(0, 0, w, h);
     }
 
-    const pal = palette(mood);
+    const pal = palette(mood, mode);
 
-    // additive glow
     g.save();
     g.globalCompositeOperation = "lighter";
     for (const b of bodies) {
@@ -317,14 +316,13 @@ export function createPhysicsLayer(
     }
     g.restore();
 
-    // glass bodies
     for (const b of bodies) {
       const st = (b as any)._style as { tint: number };
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
 
-      const baseA = 0.040 + 0.020 * st.tint;
+      const baseA = mode === "MONO" ? (0.032 + 0.014 * st.tint) : (0.040 + 0.020 * st.tint);
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
 
       g.save();
@@ -357,13 +355,12 @@ export function createPhysicsLayer(
         g.fillStyle = "rgba(255,255,255,0.12)";
         g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
       }
-
       g.restore();
     }
   }
 
   return {
-    resize: (W: number, H: number) => {
+    resize: (W: number, H: number, _dpr: number) => {
       w = W;
       h = H;
       canvas.width = w;
@@ -380,6 +377,16 @@ export function createPhysicsLayer(
     setMood: (m: number) => {
       mood = clamp(m, 0, 1);
     },
+    setMode: (name: string) => {
+      const n = name.toUpperCase();
+      if (n === "ICE" || n === "NEON" || n === "VIOLET" || n === "MONO") mode = n;
+    },
+    setDensity: (count: number) => {
+      const c = clamp(Math.round(count), 10, 40);
+      if (c === cfg.count) return;
+      cfg.count = c;
+      rebuildBodies();
+    },
     step: (t: number, dt: number) => {
       acc += dt;
       acc = Math.min(acc, 0.2);
@@ -388,7 +395,7 @@ export function createPhysicsLayer(
         Engine.update(engine, fixed * 1000);
         acc -= fixed;
       }
-      draw(t);
+      draw();
     },
   };
 }

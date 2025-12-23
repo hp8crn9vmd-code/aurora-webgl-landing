@@ -4,16 +4,14 @@ import * as THREE from "three";
 import vert from "./shaders/fullscreen.vert.glsl";
 import frag from "./shaders/aurora.frag.glsl";
 
-// -------------------- Config --------------------
 const CONFIG = {
   reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
   grid: { size: 14, gap: 10, alpha: 0.018, sparkleAlpha: 0.012 },
   dprMax: 2,
-
-  // Physics lazy-load settings
   physics: {
     enabled: true,
-    startDelayMs: 250, // give time for first paint
+    startDelayMs: 250,
+    // base count is adaptive (see adapt())
     count: 22,
     restitution: 0.92,
     frictionAir: 0.012,
@@ -25,13 +23,9 @@ const CONFIG = {
     impulseChance: 0.01,
     impulseStrength: 0.00045,
     mouseForce: 0.00006,
-    mouseRadius: 220
-  }
+    mouseRadius: 220,
+  },
 } as const;
-
-let mood = 0; // 0..1
-let moodTarget = 0;
-let moodTimer = 0;
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -52,7 +46,7 @@ function noise2(x: number, y: number) {
   return ab + (cd - ab) * v;
 }
 
-// -------------------- Layer 1: WebGL (5 interacting components) --------------------
+// -------------------- Layer 1: WebGL --------------------
 const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: "high-performance" });
 renderer.setClearColor(0x05070b, 1);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -69,7 +63,7 @@ const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 type Comp = { pos: THREE.Vector2; vel: THREE.Vector2 };
 const comps: Comp[] = Array.from({ length: 5 }, (_, i) => ({
   pos: new THREE.Vector2((i - 2) * 0.35, (Math.random() - 0.5) * 0.35),
-  vel: new THREE.Vector2((Math.random() - 0.5) * 0.04, (Math.random() - 0.5) * 0.04)
+  vel: new THREE.Vector2((Math.random() - 0.5) * 0.04, (Math.random() - 0.5) * 0.04),
 }));
 
 const points = Array.from({ length: 5 }, () => new THREE.Vector2());
@@ -78,7 +72,7 @@ const uniforms = {
   uTime: { value: 0 },
   uMouse: { value: new THREE.Vector2(0, 0) },
   uMotion: { value: CONFIG.reducedMotion ? 0.0 : 1.0 },
-  uPoints: { value: points }
+  uPoints: { value: points },
 };
 
 const material = new THREE.ShaderMaterial({ vertexShader: vert, fragmentShader: frag, uniforms });
@@ -119,17 +113,15 @@ function stepComponents(dt: number) {
     if (comps[i].pos.y < minY) { comps[i].pos.y = minY; comps[i].vel.y *= -0.86; }
     if (comps[i].pos.y > maxY) { comps[i].pos.y = maxY; comps[i].vel.y *= -0.86; }
   }
-
   for (let i = 0; i < 5; i++) points[i].copy(comps[i].pos);
 }
 
-// -------------------- Layer 2: Glass grid (Canvas) --------------------
+// -------------------- Layer 2: Glass Grid --------------------
 const layer2 = document.createElement("canvas");
 layer2.id = "layer2";
 layer2.className = "bg-layer";
 layer2.setAttribute("aria-hidden", "true");
 document.body.appendChild(layer2);
-
 const g2 = layer2.getContext("2d")!;
 
 function drawGrid(w: number, h: number) {
@@ -161,10 +153,96 @@ function drawGrid(w: number, h: number) {
   }
 }
 
-// -------------------- Shared resize + mouse + master loop --------------------
+// -------------------- Shared: resize + mouse --------------------
 let currentDpr = Math.min(window.devicePixelRatio || 1, CONFIG.dprMax);
 let running = true;
 
+function setMouse(x: number, y: number) {
+  uniforms.uMouse.value.set(x * currentDpr, (window.innerHeight - y) * currentDpr);
+  if (physicsApi) physicsApi.setMouse(uniforms.uMouse.value.x, uniforms.uMouse.value.y);
+}
+window.addEventListener("mousemove", (e) => setMouse(e.clientX, e.clientY));
+window.addEventListener("touchmove", (e) => {
+  const t = e.touches[0];
+  if (t) setMouse(t.clientX, t.clientY);
+}, { passive: true });
+
+window.addEventListener("resize", () => resize());
+document.addEventListener("visibilitychange", () => { running = !document.hidden; });
+
+// -------------------- Gallery Director --------------------
+type GalleryMode = { name: "ICE" | "NEON" | "VIOLET" | "MONO"; mood: number; grade: number };
+const MODES: GalleryMode[] = [
+  { name: "ICE", mood: 0.10, grade: 0.25 },
+  { name: "NEON", mood: 0.45, grade: 0.55 },
+  { name: "VIOLET", mood: 0.80, grade: 0.70 },
+  { name: "MONO", mood: 0.98, grade: 0.10 }, // handled in physics palette
+];
+
+let modeIndex = 0;
+let mood = MODES[0].mood;
+let moodTarget = MODES[0].mood;
+let grade = MODES[0].grade;
+let gradeTarget = MODES[0].grade;
+let modeTimer = 0;
+
+function chooseNextMode() {
+  modeIndex = (modeIndex + 1) % MODES.length;
+  moodTarget = MODES[modeIndex].mood;
+  gradeTarget = MODES[modeIndex].grade;
+}
+
+function applyGradeToBody() {
+  // subtle overall grade via CSS filter on top layers (professional gallery feel)
+  // keep it subtle (no obvious filter)
+  const sat = 1.0 + grade * 0.12;
+  const con = 1.0 + grade * 0.10;
+  const bri = 1.0 + grade * 0.04;
+  layer2.style.filter = `saturate(${sat}) contrast(${con}) brightness(${bri})`;
+  layer3.style.filter = `saturate(${sat}) contrast(${con}) brightness(${bri})`;
+}
+
+// -------------------- Lazy Physics --------------------
+const layer3 = document.createElement("canvas");
+layer3.id = "layer3";
+layer3.className = "bg-layer";
+layer3.setAttribute("aria-hidden", "true");
+document.body.appendChild(layer3);
+
+type PhysicsApi = {
+  resize: (w: number, h: number, dpr: number) => void;
+  setMouse: (mx: number, my: number) => void;
+  setMood: (mood: number) => void;
+  setMode: (name: string) => void;
+  setDensity: (count: number) => void;
+  step: (t: number, dt: number) => void;
+};
+
+let physicsApi: PhysicsApi | null = null;
+
+function adaptiveCount(w: number, h: number) {
+  // Adaptive density for devices (iPad/mobile/desktop)
+  const area = (w * h) / 1_000_000; // in MP (device pixels)
+  // approx: 0.8MP => ~14, 2.5MP => ~22, 5MP => ~30
+  return clamp(Math.round(12 + area * 7), 14, 32);
+}
+
+async function initPhysics() {
+  if (!CONFIG.physics.enabled || CONFIG.reducedMotion) return;
+
+  const mod = await import("./physics");
+  physicsApi = mod.createPhysicsLayer(layer3, { ...CONFIG.physics }, noise2, clamp, lerp);
+
+  // initial
+  physicsApi.setMood(mood);
+  physicsApi.setMode(MODES[modeIndex].name);
+  applyGradeToBody();
+
+  resize();
+}
+setTimeout(() => { void initPhysics(); }, CONFIG.physics.startDelayMs);
+
+// -------------------- Resize --------------------
 function resize() {
   currentDpr = Math.min(window.devicePixelRatio || 1, CONFIG.dprMax);
   const w = Math.floor(window.innerWidth * currentDpr);
@@ -175,55 +253,13 @@ function resize() {
 
   drawGrid(w, h);
 
-  // physics canvas sizing handled by lazy module (if enabled)
-  if (physicsApi) physicsApi.resize(w, h, currentDpr);
+  if (physicsApi) {
+    physicsApi.resize(w, h, currentDpr);
+    physicsApi.setDensity(adaptiveCount(w, h));
+  }
 }
 
-function setMouse(x: number, y: number) {
-  uniforms.uMouse.value.set(x * currentDpr, (window.innerHeight - y) * currentDpr);
-  if (physicsApi) physicsApi.setMouse(uniforms.uMouse.value.x, uniforms.uMouse.value.y);
-}
-
-window.addEventListener("mousemove", (e) => setMouse(e.clientX, e.clientY));
-window.addEventListener("touchmove", (e) => {
-  const t = e.touches[0];
-  if (t) setMouse(t.clientX, t.clientY);
-}, { passive: true });
-
-window.addEventListener("resize", resize);
-document.addEventListener("visibilitychange", () => { running = !document.hidden; });
-
-// -------------------- Lazy Physics Module (Layer 3) --------------------
-const layer3 = document.createElement("canvas");
-layer3.id = "layer3";
-layer3.className = "bg-layer";
-layer3.setAttribute("aria-hidden", "true");
-document.body.appendChild(layer3);
-
-type PhysicsApi = {
-  setMood: (mood: number) => void;
-  resize: (w: number, h: number, dpr: number) => void;
-  setMouse: (mx: number, my: number) => void;
-  step: (t: number, dt: number) => void;
-};
-
-let physicsApi: PhysicsApi | null = null;
-
-async function initPhysics() {
-  if (!CONFIG.physics.enabled || CONFIG.reducedMotion) return;
-
-  // Dynamic import => code split
-  const mod = await import("./physics");
-  physicsApi = mod.createPhysicsLayer(layer3, CONFIG.physics, noise2, clamp, lerp);
-
-  // initial mood
-  physicsApi.setMood(0);
-  resize();
-}
-
-setTimeout(() => { void initPhysics(); }, CONFIG.physics.startDelayMs);
-
-// -------------------- Main RAF --------------------
+// -------------------- RAF --------------------
 resize();
 
 const start = performance.now();
@@ -234,22 +270,28 @@ function loop(now: number) {
   last = now;
 
   if (running) {
-    uniforms.uTime.value = (now - start) / 1000;
-    if (!CONFIG.reducedMotion) stepComponents(dt);
+    const t = (now - start) / 1000;
+    uniforms.uTime.value = t;
 
+    if (!CONFIG.reducedMotion) stepComponents(dt);
     renderer.render(scene, camera);
 
-    // Art Director mood cycle (slow + cinematic)
-    moodTimer += dt;
-    if (moodTimer > (12 + Math.random() * 8)) {
-      moodTimer = 0;
-      moodTarget = Math.random();
+    // Gallery transitions
+    modeTimer += dt;
+    if (modeTimer > (14 + Math.random() * 10)) {
+      modeTimer = 0;
+      chooseNextMode();
     }
-    mood = mood + (moodTarget - mood) * 0.02;
-    if (physicsApi) physicsApi.setMood(mood);
+
+    // smooth transition
+    mood += (moodTarget - mood) * 0.02;
+    grade += (gradeTarget - grade) * 0.02;
 
     if (physicsApi && !CONFIG.reducedMotion) {
-      physicsApi.step(uniforms.uTime.value, dt);
+      physicsApi.setMood(mood);
+      physicsApi.setMode(MODES[modeIndex].name);
+      applyGradeToBody();
+      physicsApi.step(t, dt);
     }
   }
 
