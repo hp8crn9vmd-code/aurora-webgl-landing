@@ -179,6 +179,10 @@ const MODES: GalleryMode[] = [
   { name: "MONO", mood: 0.98, grade: 0.10 }, // handled in physics palette
 ];
 
+const MATERIALS = ["GLASS","CERAMIC","METAL"] as const;
+let materialIndex = 0;
+let materialTimer = 0;
+
 let modeIndex = 0;
 let mood = MODES[0].mood;
 let moodTarget = MODES[0].mood;
@@ -214,6 +218,7 @@ type PhysicsApi = {
   setMouse: (mx: number, my: number) => void;
   setMood: (mood: number) => void;
   setMode: (name: string) => void;
+  setMaterial: (name: string) => void;
   setDensity: (count: number) => void;
   step: (t: number, dt: number) => void;
 };
@@ -234,6 +239,7 @@ async function initPhysics() {
   // initial
   physicsApi.setMood(mood);
   physicsApi.setMode(MODES[modeIndex].name);
+      physicsApi.setMaterial(MATERIALS[materialIndex]);
   applyGradeToBody();
 
   resize();
@@ -281,13 +287,21 @@ function loop(now: number) {
       chooseNextMode();
     }
 
-    // smooth transition
+    // Material cycling (Gallery)
+    materialTimer += dt;
+    if (materialTimer > (18 + Math.random() * 12)) {
+      materialTimer = 0;
+      materialIndex = (materialIndex + 1) % MATERIALS.length;
+    }
+
+// smooth transition
     mood += (moodTarget - mood) * 0.02;
     grade += (gradeTarget - grade) * 0.02;
 
     if (physicsApi && !CONFIG.reducedMotion) {
       physicsApi.setMood(mood);
       physicsApi.setMode(MODES[modeIndex].name);
+      physicsApi.setMaterial(MATERIALS[materialIndex]);
       applyGradeToBody();
       physicsApi.step(t, dt);
     }

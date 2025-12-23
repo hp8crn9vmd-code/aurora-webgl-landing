@@ -42,6 +42,8 @@ function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
 }
 
 type ModeName = "ICE" | "NEON" | "VIOLET" | "MONO";
+type MaterialName = "GLASS" | "CERAMIC" | "METAL";
+
 function palette(mood: number, mode: ModeName) {
   if (mode === "MONO") return { r: 235, g: 240, b: 255 };
   if (mood < 0.33) return { r: 190, g: 225, b: 255 };
@@ -85,15 +87,16 @@ export function createPhysicsLayer(
 
   let mood = 0;
   let mode: ModeName = "ICE";
+  let material: MaterialName = "GLASS";
 
   const V = {
-    // “real” rendering knobs
+    // base (will be modified by material)
     glowA: 0.085,
     glassFill: 0.070,
     glassStroke: 0.12,
-    fresnel: 0.085,       // rim light
-    specular: 0.14,       // highlight strength
-    shadowA: 0.07,        // under-shadow strength
+    fresnel: 0.085,
+    specular: 0.14,
+    shadowA: 0.07,
     sparkleChance: 0.060,
 
     // composition
@@ -111,7 +114,7 @@ export function createPhysicsLayer(
     magnetRadius: 620,
     magnetWobble: 0.18,
 
-    // mouse behaves as repulsive magnet too (premium)
+    // mouse repulsion
     mouseRepelBoost: 1.25,
 
     // springs
@@ -125,6 +128,42 @@ export function createPhysicsLayer(
     // spawn
     spawnPadding: 32,
   } as const;
+
+  // material grading (no UI)
+  function materialKnobs(mat: MaterialName) {
+    switch (mat) {
+      case "CERAMIC":
+        return {
+          fill: 0.060,
+          stroke: 0.13,
+          fresnel: 0.055,
+          spec: 0.10,
+          glow: 0.060,
+          shadow: 0.09,
+          rough: 0.55, // more matte
+        };
+      case "METAL":
+        return {
+          fill: 0.040,
+          stroke: 0.16,
+          fresnel: 0.035,
+          spec: 0.18,
+          glow: 0.050,
+          shadow: 0.11,
+          rough: 0.22, // sharper highlights
+        };
+      default: // GLASS
+        return {
+          fill: 0.070,
+          stroke: 0.12,
+          fresnel: 0.085,
+          spec: 0.14,
+          glow: 0.085,
+          shadow: 0.07,
+          rough: 0.35,
+        };
+    }
+  }
 
   function rebuildBounds() {
     bounds.forEach((b) => Composite.remove(world, b));
@@ -183,7 +222,7 @@ export function createPhysicsLayer(
     const x = pt.x;
     const y = pt.y;
 
-    const base = 6 + Math.random() * 10; // small => fill screen
+    const base = 6 + Math.random() * 10;
     const kind = Math.random();
 
     const common = {
@@ -301,10 +340,8 @@ export function createPhysicsLayer(
 
   function rebuildBodies() {
     clearAll();
-
     const pts = spawnPoints(cfg.count);
     for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i, pts[i % pts.length]));
-
     Composite.add(world, bodies);
     addMicroSprings();
   }
@@ -313,9 +350,10 @@ export function createPhysicsLayer(
     const cx = w * 0.5;
     const cy = h * 0.5;
 
-    const dxC = (cx - b.position.x) / Math.max(w, 1);
-    const dyC = (cy - b.position.y) / Math.max(h, 1);
-    Body.applyForce(b, b.position, { x: dxC * V.centerForce, y: dyC * V.centerForce });
+    Body.applyForce(b, b.position, {
+      x: ((cx - b.position.x) / Math.max(w, 1)) * V.centerForce,
+      y: ((cy - b.position.y) / Math.max(h, 1)) * V.centerForce,
+    });
 
     const margin = 110;
     const left = margin - b.position.x;
@@ -337,14 +375,8 @@ export function createPhysicsLayer(
 
     for (let i = 0; i < V.magnetCount; i++) {
       const ph = i * 2.1;
-      const x =
-        cx +
-        a * Math.sin(t * (0.20 + V.magnetWobble * 0.10) + ph) +
-        a * 0.52 * Math.sin(t * 0.11 + ph * 1.7);
-      const y =
-        cy +
-        a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) +
-        a * 0.42 * Math.cos(t * 0.13 + ph * 1.3);
+      const x = cx + a * Math.sin(t * (0.20 + V.magnetWobble * 0.10) + ph) + a * 0.52 * Math.sin(t * 0.11 + ph * 1.7);
+      const y = cy + a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) + a * 0.42 * Math.cos(t * 0.13 + ph * 1.3);
       mags.push({ x, y });
     }
     return mags;
@@ -385,8 +417,7 @@ export function createPhysicsLayer(
       }
 
       if (near >= 10) {
-        const cx = w * 0.5;
-        const cy = h * 0.5;
+        const cx = w * 0.5, cy = h * 0.5;
         const dx = b.position.x - cx;
         const dy = b.position.y - cy;
         const d = Math.sqrt(dx * dx + dy * dy) + 0.001;
@@ -403,40 +434,27 @@ export function createPhysicsLayer(
     const ay = (0.5 + 0.16 * Math.cos(t * 0.13)) * hSafe;
 
     const mags = magnetPositions(t);
+    const mr2 = V.magnetRadius * V.magnetRadius;
 
     applyAntiClusterSpatialHash();
 
-    const mr2 = V.magnetRadius * V.magnetRadius;
-
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
-      const st = (b as any)._style as {
-        flow: number;
-        impulse: number;
-        massBias: number;
-        tint: number;
-        bias: number;
-      };
+      const st = (b as any)._style as { flow: number; impulse: number; massBias: number; tint: number };
 
       // curl flow field
       const px = b.position.x * 0.004;
       const py = b.position.y * 0.004;
       const c = curlNoise(noise2, px, py, t);
 
-      Body.applyForce(b, b.position, {
-        x: c.x * cfg.turbulence * 1.70 * st.flow,
-        y: c.y * cfg.turbulence * 1.70 * st.flow,
-      });
+      Body.applyForce(b, b.position, { x: c.x * cfg.turbulence * 1.70 * st.flow, y: c.y * cfg.turbulence * 1.70 * st.flow });
 
       // soft coherence drift
-      Body.applyForce(b, b.position, {
-        x: ((ax - b.position.x) / wSafe) * 0.000003,
-        y: ((ay - b.position.y) / hSafe) * 0.000003,
-      });
+      Body.applyForce(b, b.position, { x: ((ax - b.position.x) / wSafe) * 0.000003, y: ((ay - b.position.y) / hSafe) * 0.000003 });
 
-      // ✅ MAGNETS: REPULSION ONLY (push away from magnets)
+      // magnets: REPULSION ONLY
       for (const m of mags) {
-        const dx = b.position.x - m.x; // away direction
+        const dx = b.position.x - m.x;
         const dy = b.position.y - m.y;
         const d2 = dx * dx + dy * dy;
         if (d2 < mr2) {
@@ -447,7 +465,7 @@ export function createPhysicsLayer(
         }
       }
 
-      // ✅ Mouse: repulsive magnet (push away)
+      // mouse repulsion
       const mdx = b.position.x / wSafe - mx;
       const mdy = b.position.y / hSafe - my;
       const md = Math.sqrt(mdx * mdx + mdy * mdy) * Math.max(wSafe, hSafe);
@@ -483,22 +501,22 @@ export function createPhysicsLayer(
     }
 
     const pal = palette(mood, mode);
+    const mk = materialKnobs(material);
 
-    // moving light direction (makes shapes feel "real")
+    // moving light direction
     const lx = Math.cos(t * 0.22) * 0.8 + 0.2;
     const ly = Math.sin(t * 0.18) * 0.8 - 0.2;
 
-    // under-shadow (cheap, realistic depth)
+    // under-shadow
     for (const b of bodies) {
       const x = b.position.x;
       const y = b.position.y;
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
-
       const sx = x + lx * r * 0.55;
       const sy = y + ly * r * 0.55;
 
       const sh = g.createRadialGradient(sx, sy, r * 0.3, sx, sy, r * 2.2);
-      sh.addColorStop(0, `rgba(0,0,0,${V.shadowA})`);
+      sh.addColorStop(0, `rgba(0,0,0,${mk.shadow})`);
       sh.addColorStop(1, "rgba(0,0,0,0)");
       g.fillStyle = sh;
       g.beginPath();
@@ -506,7 +524,7 @@ export function createPhysicsLayer(
       g.fill();
     }
 
-    // glow pass (additive)
+    // glow pass
     g.save();
     g.globalCompositeOperation = "lighter";
     for (const b of bodies) {
@@ -516,7 +534,7 @@ export function createPhysicsLayer(
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
       const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.0);
-      grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${V.glowA * st.tint})`);
+      grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${mk.glow * st.tint})`);
       grad.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},0.0)`);
       g.fillStyle = grad;
       g.beginPath();
@@ -525,66 +543,65 @@ export function createPhysicsLayer(
     }
     g.restore();
 
-    // main “real” glass bodies
+    // bodies
     for (const b of bodies) {
       const st = (b as any)._style as { tint: number; bias: number };
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
-
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
-      // speed -> more specular (looks alive)
       const vx = (b.velocity?.x ?? 0);
       const vy = (b.velocity?.y ?? 0);
       const speed = Math.sqrt(vx * vx + vy * vy);
-      const spec = clamp(0.08 + speed * 0.018, 0.08, V.specular);
+      const spec = clamp(0.07 + speed * 0.018, 0.07, mk.spec);
 
       g.save();
       g.translate(x, y);
       g.rotate(angle);
 
-      // shape path
       const verts = b.vertices;
       g.beginPath();
       g.moveTo(verts[0].x - x, verts[0].y - y);
       for (let i = 1; i < verts.length; i++) g.lineTo(verts[i].x - x, verts[i].y - y);
       g.closePath();
 
-      // body fill gradient (realistic glass)
+      // fill
       const lg = g.createLinearGradient(-r, -r, r, r);
-      const baseA = mode === "MONO" ? (0.030 + 0.012 * st.tint) : (0.036 + 0.020 * st.tint);
+      const baseA = material === "METAL" ? (0.020 + 0.010 * st.tint) : (0.034 + 0.018 * st.tint);
       lg.addColorStop(0, `rgba(255,255,255,${baseA})`);
-      lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${V.glassFill * st.tint})`);
+      lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${mk.fill * st.tint})`);
       g.fillStyle = lg;
       g.fill();
 
-      // outer edge
-      g.strokeStyle = `rgba(255,255,255,${V.glassStroke})`;
+      // edge
+      g.strokeStyle = `rgba(255,255,255,${mk.stroke})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // Fresnel rim (fake but looks real)
-      g.strokeStyle = `rgba(255,255,255,${V.fresnel})`;
+      // fresnel rim
+      g.strokeStyle = `rgba(255,255,255,${mk.fresnel})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // specular line (light direction + per-body bias)
-      g.strokeStyle = `rgba(255,255,255,${spec})`;
+      // specular line (roughness changes apparent sharpness by opacity)
+      const specA = spec * (1.0 - mk.rough * 0.55);
+      g.strokeStyle = `rgba(255,255,255,${specA})`;
       g.beginPath();
       g.moveTo(-r * (0.72 - st.bias * 0.12), -r * 0.55);
       g.lineTo(r * (0.18 + st.bias * 0.10), -r * (0.95 - st.bias * 0.08));
       g.stroke();
 
-      // specular glint dot
-      g.fillStyle = `rgba(255,255,255,${spec * 0.65})`;
+      // glint dot
+      g.fillStyle = `rgba(255,255,255,${specA * 0.65})`;
       g.beginPath();
       g.arc(-r * 0.20, -r * 0.40, 1.2, 0, TAU);
       g.fill();
 
-      // micro sparkle
-      if (Math.random() < V.sparkleChance) {
-        g.fillStyle = "rgba(255,255,255,0.11)";
+      // micro sparkle (less on ceramic/metal)
+      const sparkle = material === "GLASS" ? 1.0 : 0.55;
+      if (Math.random() < 0.060 * sparkle) {
+        g.fillStyle = "rgba(255,255,255,0.10)";
         g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
       }
 
@@ -613,6 +630,10 @@ export function createPhysicsLayer(
     setMode: (name: string) => {
       const n = name.toUpperCase();
       if (n === "ICE" || n === "NEON" || n === "VIOLET" || n === "MONO") mode = n;
+    },
+    setMaterial: (name: string) => {
+      const n = name.toUpperCase();
+      if (n === "GLASS" || n === "CERAMIC" || n === "METAL") material = n;
     },
     setDensity: (count: number) => {
       const c = clamp(Math.round(count), 80, 220);
