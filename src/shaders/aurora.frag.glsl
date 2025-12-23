@@ -4,6 +4,7 @@ varying vec2 vUv;
 uniform vec2 uResolution;
 uniform float uTime;
 uniform vec2 uMouse;
+uniform float uMotion; // 0..1
 
 float hash(vec2 p){
   p = fract(p * vec2(123.34, 456.21));
@@ -45,16 +46,21 @@ vec3 palette(float t){
   return col;
 }
 
+// subtle dithering to reduce banding
+float dither(vec2 uv){
+  // screen-space noise
+  return hash(uv * uResolution.xy) - 0.5;
+}
+
 void main(){
   vec2 uv = vUv;
 
   vec2 p = (uv * uResolution - 0.5 * uResolution) / min(uResolution.x, uResolution.y);
 
-  // تفاعل لطيف مع الماوس
   vec2 m = (uMouse / uResolution) - 0.5;
   p += m * 0.15;
 
-  float t = uTime * 0.12;
+  float t = uTime * 0.12 * uMotion;
 
   float n1 = fbm(p * 1.25 + vec2(0.0, t));
   float n2 = fbm(p * 2.15 - vec2(t * 1.3, t * 0.7));
@@ -62,7 +68,6 @@ void main(){
 
   float field = (n1 * 0.55 + n2 * 0.30 + n3 * 0.25);
 
-  // aurora bands
   float bands = smoothstep(0.25, 0.95, fbm(vec2(p.x * 1.2, p.y * 3.2) + vec2(t, -t)));
   field = mix(field, field + bands * 0.35, 0.55);
 
@@ -70,14 +75,14 @@ void main(){
   vec3 col = palette(field);
   col += vec3(0.10, 0.18, 0.28) * glow;
 
-  // vignette
   float r = length(p);
   float vig = smoothstep(1.15, 0.25, r);
   col *= vig;
 
-  // film grain
+  // film grain + dithering
   float g = hash(uv * (uResolution.xy * 0.75) + fract(uTime)) - 0.5;
-  col += g * 0.035;
+  col += g * 0.030;
+  col += dither(uv) * 0.015;
 
   col = pow(col, vec3(0.95));
   col = clamp(col, 0.0, 1.0);
