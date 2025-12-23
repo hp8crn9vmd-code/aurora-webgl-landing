@@ -51,14 +51,24 @@ function palette(mood: number, mode: ModeName) {
   return { r: 215, g: 190, b: 255 };
 }
 
-type CellKey = string;
-const cellKey = (ix: number, iy: number): CellKey => `${ix},${iy}`;
-
 function shuffleInPlace<T>(a: T[]) {
   for (let i = a.length - 1; i > 0; i--) {
     const j = (Math.random() * (i + 1)) | 0;
     [a[i], a[j]] = [a[j], a[i]];
   }
+}
+
+function clamp01(v: number) {
+  return Math.max(0, Math.min(1, v));
+}
+
+// cheap “hue-ish” shift: nudge RGB channels (keeps it artistic & fast)
+function shiftRGB(r: number, g: number, b: number, hue: number) {
+  const t = (hue - 0.5) * 2.0; // -1..1
+  const rr = r + t * 38;
+  const gg = g + Math.sin(hue * 6.283) * 22;
+  const bb = b - t * 32;
+  return { r: Math.max(0, Math.min(255, rr)), g: Math.max(0, Math.min(255, gg)), b: Math.max(0, Math.min(255, bb)) };
 }
 
 export function createPhysicsLayer(
@@ -69,15 +79,11 @@ export function createPhysicsLayer(
   lerp: Lerp,
 ) {
   const g = canvas.getContext("2d")!;
-  const { Engine, Bodies, Composite, Body, Constraint } = Matter;
+  const { Engine, Bodies, Composite, Body } = Matter;
 
   const engine = Engine.create();
   engine.gravity.scale = 0;
   const world = engine.world;
-
-  let bounds: Matter.Body[] = [];
-  let bodies: Matter.Body[] = [];
-  let constraints: Matter.Constraint[] = [];
 
   let w = 0;
   let h = 0;
@@ -90,7 +96,7 @@ export function createPhysicsLayer(
   let material: MaterialName = "GLASS";
 
   const V = {
-    // base (will be modified by material)
+    // rendering (base; material overrides)
     glowA: 0.085,
     glassFill: 0.070,
     glassStroke: 0.12,
@@ -99,84 +105,49 @@ export function createPhysicsLayer(
     shadowA: 0.07,
     sparkleChance: 0.060,
 
-    // composition
-    centerForce: 0.0000035,
-    edgeRepel: 0.000012,
+    // AO/contact feel
+    aoA: 0.10,
+    aoR: 1.55,
+    contactA: 0.12,
+    contactR: 1.05,
 
-    // anti-cluster
-    cellSize: 110,
-    repelRadius: 95,
-    repelForce: 0.000030,
+    // cages
+    cagePadding: 10,
+    cageWobble: 0.20,       // cage center motion amount (relative to cage size)
+    wallK: 0.000030,        // soft wall strength
+    wallDamp: 0.000010,     // damping near walls
 
-    // magnets (REPULSION ONLY)
-    magnetCount: 4,
-    magnetForce: 0.000080,
-    magnetRadius: 620,
-    magnetWobble: 0.18,
+    // internal motion
+    curlK: 1.85,            // curl multiplier
+    jitterK: 0.000007,      // micro jitter
+    impulseChance: 0.020,   // a bit higher for “alive”
+    impulseStrength: 0.00055,
 
-    // mouse repulsion
-    mouseRepelBoost: 1.25,
+    // magnets (repulsion only) - subtle now, to avoid leaving cages
+    magnetCount: 3,
+    magnetForce: 0.000040,
+    magnetRadius: 520,
+    magnetWobble: 0.16,
 
-    // springs
-    springStiffness: 0.0022,
-    springDamping: 0.14,
-    springLenMin: 40,
-    springLenMax: 120,
-    springPerBody: 1,
-    maxSprings: 220,
+    // mouse repulsion (kept)
+    mouseRepelBoost: 1.15,
 
     // spawn
-    spawnPadding: 32,
+    spawnPadding: 28,
   } as const;
 
-  // material grading (no UI)
   function materialKnobs(mat: MaterialName) {
     switch (mat) {
       case "CERAMIC":
-        return {
-          fill: 0.060,
-          stroke: 0.13,
-          fresnel: 0.055,
-          spec: 0.10,
-          glow: 0.060,
-          shadow: 0.09,
-          rough: 0.55, // more matte
-        };
+        return { fill: 0.060, stroke: 0.13, fresnel: 0.055, spec: 0.10, glow: 0.060, shadow: 0.09, rough: 0.55 };
       case "METAL":
-        return {
-          fill: 0.040,
-          stroke: 0.16,
-          fresnel: 0.035,
-          spec: 0.18,
-          glow: 0.050,
-          shadow: 0.11,
-          rough: 0.22, // sharper highlights
-        };
-      default: // GLASS
-        return {
-          fill: 0.070,
-          stroke: 0.12,
-          fresnel: 0.085,
-          spec: 0.14,
-          glow: 0.085,
-          shadow: 0.07,
-          rough: 0.35,
-        };
+        return { fill: 0.040, stroke: 0.16, fresnel: 0.035, spec: 0.18, glow: 0.050, shadow: 0.11, rough: 0.22 };
+      default:
+        return { fill: 0.070, stroke: 0.12, fresnel: 0.085, spec: 0.14, glow: 0.085, shadow: 0.07, rough: 0.35 };
     }
   }
 
-  function rebuildBounds() {
-    bounds.forEach((b) => Composite.remove(world, b));
-    const thick = 160;
-    bounds = [
-      Bodies.rectangle(w / 2, -thick / 2, w + thick * 2, thick, { isStatic: true, render: { visible: false } }),
-      Bodies.rectangle(w / 2, h + thick / 2, w + thick * 2, thick, { isStatic: true, render: { visible: false } }),
-      Bodies.rectangle(-thick / 2, h / 2, thick, h + thick * 2, { isStatic: true, render: { visible: false } }),
-      Bodies.rectangle(w + thick / 2, h / 2, thick, h + thick * 2, { isStatic: true, render: { visible: false } }),
-    ];
-    Composite.add(world, bounds);
-  }
-
+  // Even distribution of cage centers (jittered grid)
   function spawnPoints(count: number) {
     const pts: { x: number; y: number }[] = [];
     const pad = V.spawnPadding;
@@ -209,250 +180,253 @@ export function createPhysicsLayer(
     });
     const c1 = Bodies.circle(x - length * 0.5, y, radius, common);
     const c2 = Bodies.circle(x + length * 0.5, y, radius, common);
-
-    return Body.create({
-      parts: [rect, c1, c2],
-      restitution: common.restitution,
-      frictionAir: common.frictionAir,
-      density: common.density,
-    });
+    return Body.create({ parts: [rect, c1, c2], restitution: common.restitution, frictionAir: common.frictionAir, density: common.density });
   }
 
-  function makeBody(i: number, pt: { x: number; y: number }) {
-    const x = pt.x;
-    const y = pt.y;
+  type Cage = {
+    baseX: number;
+    baseY: number;
+    size: number;  // square size
+    seed: number;
+  };
 
-    const base = 6 + Math.random() * 10;
+  type Meta = {
+    body: Matter.Body;
+    cage: Cage;
+    hue: number;
+    scale: number;
+    nextMorph: number;
+    nextColor: number;
+  };
+
+  let metas: Meta[] = [];
+
+  function computeCageSize(count: number) {
+    const areaPer = (w * h) / Math.max(1, count);
+    // small squares, but not too tiny
+    const s = Math.sqrt(areaPer) * 0.92;
+    return clamp(s, 56, 150);
+  }
+
+  function makeBodyAt(i: number, x: number, y: number, size: number) {
+    const base = clamp(size * (0.16 + Math.random() * 0.10), 7, 18); // size tied to cage
     const kind = Math.random();
 
     const common = {
-      restitution: cfg.restitution,
-      frictionAir: cfg.frictionAir,
+      restitution: clamp(cfg.restitution, 0.85, 0.98),
+      frictionAir: clamp(cfg.frictionAir, 0.007, 0.030),
       density: cfg.density,
     };
 
     let b: Matter.Body;
 
-    if (kind < 0.34) {
+    if (kind < 0.30) {
       b = Bodies.circle(x, y, base * (0.85 + Math.random() * 0.25), common);
-    } else if (kind < 0.62) {
-      b = Bodies.rectangle(
-        x,
-        y,
-        base * (1.8 + Math.random() * 1.6),
-        base * (1.0 + Math.random() * 1.2),
-        { ...common, chamfer: { radius: base * (0.45 + Math.random() * 0.25) } },
-      );
-    } else if (kind < 0.84) {
+    } else if (kind < 0.58) {
+      b = Bodies.rectangle(x, y, base * (1.7 + Math.random() * 1.5), base * (1.0 + Math.random() * 1.1), {
+        ...common,
+        chamfer: { radius: base * (0.45 + Math.random() * 0.25) },
+      });
+    } else if (kind < 0.80) {
       const sides = 3 + Math.floor(Math.random() * 6);
       b = Bodies.polygon(x, y, sides, base * (1.0 + Math.random() * 0.6), {
         ...common,
         chamfer: { radius: base * (0.30 + Math.random() * 0.30) },
       });
     } else {
-      const len = base * (2.2 + Math.random() * 2.2);
+      const len = base * (2.0 + Math.random() * 2.0);
       const rad = base * (0.55 + Math.random() * 0.25);
       b = makeCapsule(x, y, len, rad, common);
     }
 
-    (b as any)._style = {
-      tint: rand01(i * 33.7) * 0.45 + 0.25,
-      massBias: rand01(i * 12.2) * 0.8 + 0.6,
-      flow: rand01(i * 66.6) * 1.7 + 0.4,
-      impulse: rand01(i * 88.8) * 1.2 + 0.4,
-      bias: rand01(i * 111.1),
-    };
+    // isolate bodies: no inter-collisions (each has its own cage)
+    b.collisionFilter.group = -1; // all share same negative group => no collisions
+    b.collisionFilter.mask = 0;
 
-    Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.12);
-    Body.setVelocity(b, { x: (Math.random() - 0.5) * 2.0, y: (Math.random() - 0.5) * 2.0 });
+    Body.setAngularVelocity(b, (Math.random() - 0.5) * 0.18);
+    Body.setVelocity(b, { x: (Math.random() - 0.5) * 1.8, y: (Math.random() - 0.5) * 1.8 });
 
     return b;
   }
 
-  function clearAll() {
-    bodies.forEach((b) => Composite.remove(world, b));
-    constraints.forEach((c) => Composite.remove(world, c));
-    bodies = [];
-    constraints = [];
-  }
+  function rebuildAll() {
+    // clear world bodies
+    Composite.clear(world, false);
 
-  function buildSpatialGrid(cs: number) {
-    const grid = new Map<CellKey, Matter.Body[]>();
-    for (const b of bodies) {
-      const ix = Math.floor(b.position.x / cs);
-      const iy = Math.floor(b.position.y / cs);
-      const k = cellKey(ix, iy);
-      const arr = grid.get(k);
-      if (arr) arr.push(b);
-      else grid.set(k, [b]);
-    }
-    return grid;
-  }
+    const count = cfg.count;
+    const pts = spawnPoints(count);
+    const cageSize = computeCageSize(count);
 
-  function addMicroSprings() {
-    const cs = V.cellSize;
-    const grid = buildSpatialGrid(cs);
-    let added = 0;
+    metas = [];
+    const bodies: Matter.Body[] = [];
 
-    for (const b of bodies) {
-      if (added >= V.maxSprings) break;
+    for (let i = 0; i < count; i++) {
+      const p = pts[i % pts.length];
+      const cage: Cage = { baseX: p.x, baseY: p.y, size: cageSize, seed: Math.random() * 10000 };
 
-      const ix = Math.floor(b.position.x / cs);
-      const iy = Math.floor(b.position.y / cs);
+      const b = makeBodyAt(i, p.x, p.y, cageSize);
+      bodies.push(b);
 
-      const candidates: Matter.Body[] = [];
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const arr = grid.get(cellKey(ix + ox, iy + oy));
-          if (arr) candidates.push(...arr);
-        }
-      }
-      if (candidates.length < 2) continue;
-
-      for (let k = 0; k < V.springPerBody; k++) {
-        if (added >= V.maxSprings) break;
-
-        const other = candidates[(Math.random() * candidates.length) | 0];
-        if (other === b) continue;
-
-        const dx = other.position.x - b.position.x;
-        const dy = other.position.y - b.position.y;
-        const d = Math.sqrt(dx * dx + dy * dy);
-
-        if (d < V.springLenMin || d > V.springLenMax) continue;
-
-        constraints.push(
-          Constraint.create({
-            bodyA: b,
-            bodyB: other,
-            stiffness: V.springStiffness * (0.7 + Math.random() * 0.6),
-            damping: V.springDamping,
-            length: d,
-            render: { visible: false },
-          }),
-        );
-        added++;
-      }
+      metas.push({
+        body: b,
+        cage,
+        hue: Math.random(),
+        scale: 1.0,
+        nextMorph: 2.0 + Math.random() * 5.0,
+        nextColor: 0.7 + Math.random() * 2.2,
+      });
     }
 
-    if (constraints.length) Composite.add(world, constraints);
-  }
-
-  function rebuildBodies() {
-    clearAll();
-    const pts = spawnPoints(cfg.count);
-    for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i, pts[i % pts.length]));
     Composite.add(world, bodies);
-    addMicroSprings();
-  }
-
-  function applyCompositionForces(b: Matter.Body) {
-    const cx = w * 0.5;
-    const cy = h * 0.5;
-
-    Body.applyForce(b, b.position, {
-      x: ((cx - b.position.x) / Math.max(w, 1)) * V.centerForce,
-      y: ((cy - b.position.y) / Math.max(h, 1)) * V.centerForce,
-    });
-
-    const margin = 110;
-    const left = margin - b.position.x;
-    const right = b.position.x - (w - margin);
-    const top = margin - b.position.y;
-    const bottom = b.position.y - (h - margin);
-
-    if (left > 0) Body.applyForce(b, b.position, { x: V.edgeRepel * (left / margin), y: 0 });
-    if (right > 0) Body.applyForce(b, b.position, { x: -V.edgeRepel * (right / margin), y: 0 });
-    if (top > 0) Body.applyForce(b, b.position, { x: 0, y: V.edgeRepel * (top / margin) });
-    if (bottom > 0) Body.applyForce(b, b.position, { x: 0, y: -V.edgeRepel * (bottom / margin) });
   }
 
   function magnetPositions(t: number) {
     const mags: { x: number; y: number }[] = [];
-    const a = Math.min(w, h) * 0.33;
+    const a = Math.min(w, h) * 0.30;
     const cx = w * 0.5;
     const cy = h * 0.5;
 
     for (let i = 0; i < V.magnetCount; i++) {
       const ph = i * 2.1;
-      const x = cx + a * Math.sin(t * (0.20 + V.magnetWobble * 0.10) + ph) + a * 0.52 * Math.sin(t * 0.11 + ph * 1.7);
-      const y = cy + a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) + a * 0.42 * Math.cos(t * 0.13 + ph * 1.3);
+      const x = cx + a * Math.sin(t * (0.20 + V.magnetWobble * 0.10) + ph) + a * 0.45 * Math.sin(t * 0.11 + ph * 1.7);
+      const y = cy + a * Math.cos(t * (0.18 + V.magnetWobble * 0.12) + ph) + a * 0.35 * Math.cos(t * 0.13 + ph * 1.3);
       mags.push({ x, y });
     }
     return mags;
   }
 
-  function applyAntiClusterSpatialHash() {
-    const cs = V.cellSize;
-    const grid = buildSpatialGrid(cs);
+  function cageCenter(c: Cage, t: number) {
+    // cage itself moves subtly (alive)
+    const wob = c.size * V.cageWobble;
+    const nx = noise2(c.baseX * 0.006 + t * 0.05, c.baseY * 0.006);
+    const ny = noise2(c.baseX * 0.006, c.baseY * 0.006 + t * 0.05);
+    const ox = (Math.sin(t * 0.55 + c.seed) * 0.55 + (nx - 0.5) * 0.9) * wob;
+    const oy = (Math.cos(t * 0.50 + c.seed * 1.2) * 0.55 + (ny - 0.5) * 0.9) * wob;
 
-    const r = V.repelRadius;
-    const r2 = r * r;
+    return {
+      x: clamp(c.baseX + ox, c.size * 0.5, w - c.size * 0.5),
+      y: clamp(c.baseY + oy, c.size * 0.5, h - c.size * 0.5),
+    };
+  }
 
-    for (const b of bodies) {
-      const ix = Math.floor(b.position.x / cs);
-      const iy = Math.floor(b.position.y / cs);
+  function softWalls(b: Matter.Body, cx: number, cy: number, size: number) {
+    const half = size * 0.5 - V.cagePadding;
 
-      let near = 0;
+    const left = cx - half;
+    const right = cx + half;
+    const top = cy - half;
+    const bottom = cy + half;
 
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const arr = grid.get(cellKey(ix + ox, iy + oy));
-          if (!arr) continue;
+    // spring-like push back in
+    const x = b.position.x;
+    const y = b.position.y;
 
-          for (const o of arr) {
-            if (o === b) continue;
-            const dx = b.position.x - o.position.x;
-            const dy = b.position.y - o.position.y;
-            const d2 = dx * dx + dy * dy;
+    let fx = 0;
+    let fy = 0;
 
-            if (d2 > 0.0001 && d2 < r2) {
-              near++;
-              const d = Math.sqrt(d2);
-              const s = (1 - d / r) * V.repelForce;
-              Body.applyForce(b, b.position, { x: (dx / d) * s, y: (dy / d) * s });
-            }
-          }
-        }
-      }
+    if (x < left) fx += (left - x) * V.wallK;
+    if (x > right) fx -= (x - right) * V.wallK;
+    if (y < top) fy += (top - y) * V.wallK;
+    if (y > bottom) fy -= (y - bottom) * V.wallK;
 
-      if (near >= 10) {
-        const cx = w * 0.5, cy = h * 0.5;
-        const dx = b.position.x - cx;
-        const dy = b.position.y - cy;
-        const d = Math.sqrt(dx * dx + dy * dy) + 0.001;
-        Body.applyForce(b, b.position, { x: (dx / d) * 0.000012, y: (dy / d) * 0.000012 });
-      }
+    // extra damping near walls
+    const dx = Math.max(0, Math.max(left - x, x - right));
+    const dy = Math.max(0, Math.max(top - y, y - bottom));
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d > 0) {
+      fx -= b.velocity.x * V.wallDamp;
+      fy -= b.velocity.y * V.wallDamp;
     }
+
+    if (fx !== 0 || fy !== 0) {
+      Body.applyForce(b, b.position, { x: fx, y: fy });
+    }
+
+    // hard clamp if extremely out (safety)
+    if (x < left - half || x > right + half || y < top - half || y > bottom + half) {
+      Body.setPosition(b, { x: clamp(x, left, right), y: clamp(y, top, bottom) });
+      Body.setVelocity(b, { x: b.velocity.x * 0.3, y: b.velocity.y * 0.3 });
+    }
+  }
+
+  function morph(meta: Meta, t: number) {
+    // Change color often, shape/size sometimes
+    if (t >= meta.nextColor) {
+      meta.hue = (meta.hue + 0.18 + Math.random() * 0.35) % 1;
+      meta.nextColor = t + (0.7 + Math.random() * 2.2);
+    }
+
+    if (t < meta.nextMorph) return;
+
+    meta.nextMorph = t + (2.0 + Math.random() * 6.0);
+
+    const b = meta.body;
+    const c = meta.cage;
+
+    const center = cageCenter(c, t);
+    const size = c.size;
+
+    // 60%: scale, 40%: rebuild shape
+    if (Math.random() < 0.60) {
+      const target = clamp(0.70 + Math.random() * 0.80, 0.60, 1.55);
+      const s = target / Math.max(0.001, meta.scale);
+      meta.scale = target;
+      Body.scale(b, s, s);
+      return;
+    }
+
+    // rebuild shape (preserve motion)
+    const pos = { x: b.position.x, y: b.position.y };
+    const vel = { x: b.velocity.x, y: b.velocity.y };
+    const av = b.angularVelocity;
+    const ang = b.angle;
+
+    Composite.remove(world, b);
+
+    const newBody = makeBodyAt((Math.random() * 1e6) | 0, pos.x, pos.y, size);
+    Body.setAngle(newBody, ang);
+    Body.setVelocity(newBody, vel);
+    Body.setAngularVelocity(newBody, av);
+
+    meta.body = newBody;
+    Composite.add(world, newBody);
+
+    // keep inside immediately
+    softWalls(newBody, center.x, center.y, size);
   }
 
   function applyForces(t: number) {
     const wSafe = Math.max(w, 1);
     const hSafe = Math.max(h, 1);
 
-    const ax = (0.5 + 0.16 * Math.sin(t * 0.17)) * wSafe;
-    const ay = (0.5 + 0.16 * Math.cos(t * 0.13)) * hSafe;
-
     const mags = magnetPositions(t);
     const mr2 = V.magnetRadius * V.magnetRadius;
 
-    applyAntiClusterSpatialHash();
+    for (const meta of metas) {
+      const b = meta.body;
+      const c = meta.cage;
 
-    for (let i = 0; i < bodies.length; i++) {
-      const b = bodies[i];
-      const st = (b as any)._style as { flow: number; impulse: number; massBias: number; tint: number };
+      const cc = cageCenter(c, t);
+      const size = c.size;
 
-      // curl flow field
+      // soft walls: keep inside cage
+      softWalls(b, cc.x, cc.y, size);
+
+      // internal unpredictable motion (curl + micro jitter)
       const px = b.position.x * 0.004;
       const py = b.position.y * 0.004;
-      const c = curlNoise(noise2, px, py, t);
+      const cu = curlNoise(noise2, px, py, t);
 
-      Body.applyForce(b, b.position, { x: c.x * cfg.turbulence * 1.70 * st.flow, y: c.y * cfg.turbulence * 1.70 * st.flow });
+      Body.applyForce(b, b.position, {
+        x: cu.x * cfg.turbulence * V.curlK,
+        y: cu.y * cfg.turbulence * V.curlK,
+      });
 
-      // soft coherence drift
-      Body.applyForce(b, b.position, { x: ((ax - b.position.x) / wSafe) * 0.000003, y: ((ay - b.position.y) / hSafe) * 0.000003 });
+      const jx = (noise2(px + t * 0.7, py) - 0.5) * V.jitterK * (0.8 + Math.random() * 0.6);
+      const jy = (noise2(px, py + t * 0.7) - 0.5) * V.jitterK * (0.8 + Math.random() * 0.6);
+      Body.applyForce(b, b.position, { x: jx, y: jy });
 
-      // magnets: REPULSION ONLY
+      // subtle global repulsive magnets (doesn't break cages)
       for (const m of mags) {
         const dx = b.position.x - m.x;
         const dy = b.position.y - m.y;
@@ -460,7 +434,7 @@ export function createPhysicsLayer(
         if (d2 < mr2) {
           const d = Math.sqrt(d2) + 0.001;
           const falloff = 1 - d / V.magnetRadius;
-          const strength = V.magnetForce * falloff * falloff * (0.75 + st.tint * 0.85);
+          const strength = V.magnetForce * falloff * falloff;
           Body.applyForce(b, b.position, { x: (dx / d) * strength, y: (dy / d) * strength });
         }
       }
@@ -474,19 +448,20 @@ export function createPhysicsLayer(
         Body.applyForce(b, b.position, { x: mdx * s, y: mdy * s });
       }
 
-      // rare impulses
-      const chance = cfg.impulseChance * st.impulse;
-      if (Math.random() < chance) {
+      // impulses (alive)
+      if (Math.random() < V.impulseChance) {
         Body.applyForce(b, b.position, {
-          x: (Math.random() - 0.5) * cfg.impulseStrength * 1.12,
-          y: (Math.random() - 0.5) * cfg.impulseStrength * 1.12,
+          x: (Math.random() - 0.5) * V.impulseStrength,
+          y: (Math.random() - 0.5) * V.impulseStrength,
         });
-        Body.setAngularVelocity(b, b.angularVelocity + (Math.random() - 0.5) * 0.30);
+        Body.setAngularVelocity(b, b.angularVelocity + (Math.random() - 0.5) * 0.25);
       }
 
-      b.frictionAir = clamp(cfg.frictionAir * (0.80 + st.massBias * 0.30), 0.007, 0.032);
+      // morph (color/size/shape)
+      morph(meta, t);
 
-      applyCompositionForces(b);
+      // damping
+      b.frictionAir = clamp(cfg.frictionAir, 0.007, 0.032);
     }
   }
 
@@ -500,18 +475,19 @@ export function createPhysicsLayer(
       g.fillRect(0, 0, w, h);
     }
 
-    const pal = palette(mood, mode);
+    const pal0 = palette(mood, mode);
     const mk = materialKnobs(material);
 
-    // moving light direction
     const lx = Math.cos(t * 0.22) * 0.8 + 0.2;
     const ly = Math.sin(t * 0.18) * 0.8 - 0.2;
 
-    // under-shadow
-    for (const b of bodies) {
+    // contact + AO based on each object (real depth)
+    for (const meta of metas) {
+      const b = meta.body;
       const x = b.position.x;
       const y = b.position.y;
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
+
       const sx = x + lx * r * 0.55;
       const sy = y + ly * r * 0.55;
 
@@ -522,19 +498,42 @@ export function createPhysicsLayer(
       g.beginPath();
       g.arc(sx, sy, r * 2.2, 0, TAU);
       g.fill();
+
+      // AO
+      const ao = g.createRadialGradient(x, y, r * 0.25, x, y, r * (1.35 + mk.rough * 0.85));
+      ao.addColorStop(0, `rgba(0,0,0,${mk.shadow * 0.08})`);
+      ao.addColorStop(0.55, `rgba(0,0,0,${(mk.shadow + 0.05) * 0.16})`);
+      ao.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = ao;
+      g.beginPath();
+      g.arc(x, y, r * (1.25 + mk.rough * 0.9), 0, TAU);
+      g.fill();
+
+      // tight contact
+      const cx = x + lx * r * 0.18;
+      const cy = y + ly * r * 0.18;
+      const cs = g.createRadialGradient(cx, cy, r * 0.10, cx, cy, r * (0.85 + mk.rough * 0.7));
+      cs.addColorStop(0, `rgba(0,0,0,${Math.min(0.18, mk.shadow * 0.55)})`);
+      cs.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = cs;
+      g.beginPath();
+      g.arc(cx, cy, r * (0.85 + mk.rough * 0.7), 0, TAU);
+      g.fill();
     }
 
-    // glow pass
+    // glow pass (additive)
     g.save();
     g.globalCompositeOperation = "lighter";
-    for (const b of bodies) {
-      const st = (b as any)._style as { tint: number };
+    for (const meta of metas) {
+      const b = meta.body;
       const x = b.position.x;
       const y = b.position.y;
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
+      const pal = shiftRGB(pal0.r, pal0.g, pal0.b, meta.hue);
+
       const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.0);
-      grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${mk.glow * st.tint})`);
+      grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${mk.glow * 0.85})`);
       grad.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},0.0)`);
       g.fillStyle = grad;
       g.beginPath();
@@ -543,18 +542,20 @@ export function createPhysicsLayer(
     }
     g.restore();
 
-    // bodies
-    for (const b of bodies) {
-      const st = (b as any)._style as { tint: number; bias: number };
+    // main bodies
+    for (const meta of metas) {
+      const b = meta.body;
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.33, 6, 22);
 
+      const pal = shiftRGB(pal0.r, pal0.g, pal0.b, meta.hue);
+
       const vx = (b.velocity?.x ?? 0);
       const vy = (b.velocity?.y ?? 0);
       const speed = Math.sqrt(vx * vx + vy * vy);
-      const spec = clamp(0.07 + speed * 0.018, 0.07, mk.spec);
+      const spec = clamp(0.07 + speed * 0.020, 0.07, mk.spec);
 
       g.save();
       g.translate(x, y);
@@ -566,41 +567,40 @@ export function createPhysicsLayer(
       for (let i = 1; i < verts.length; i++) g.lineTo(verts[i].x - x, verts[i].y - y);
       g.closePath();
 
-      // fill
+      // fill (material)
       const lg = g.createLinearGradient(-r, -r, r, r);
-      const baseA = material === "METAL" ? (0.020 + 0.010 * st.tint) : (0.034 + 0.018 * st.tint);
+      const baseA = material === "METAL" ? (0.020) : (0.034);
       lg.addColorStop(0, `rgba(255,255,255,${baseA})`);
-      lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${mk.fill * st.tint})`);
+      lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${mk.fill})`);
       g.fillStyle = lg;
       g.fill();
 
-      // edge
+      // edge + rim
       g.strokeStyle = `rgba(255,255,255,${mk.stroke})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // fresnel rim
       g.strokeStyle = `rgba(255,255,255,${mk.fresnel})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // specular line (roughness changes apparent sharpness by opacity)
+      // specular line
       const specA = spec * (1.0 - mk.rough * 0.55);
       g.strokeStyle = `rgba(255,255,255,${specA})`;
       g.beginPath();
-      g.moveTo(-r * (0.72 - st.bias * 0.12), -r * 0.55);
-      g.lineTo(r * (0.18 + st.bias * 0.10), -r * (0.95 - st.bias * 0.08));
+      g.moveTo(-r * 0.68, -r * 0.52);
+      g.lineTo(r * 0.20, -r * 0.92);
       g.stroke();
 
-      // glint dot
-      g.fillStyle = `rgba(255,255,255,${specA * 0.65})`;
+      // glint
+      g.fillStyle = `rgba(255,255,255,${specA * 0.60})`;
       g.beginPath();
       g.arc(-r * 0.20, -r * 0.40, 1.2, 0, TAU);
       g.fill();
 
-      // micro sparkle (less on ceramic/metal)
+      // micro sparkle
       const sparkle = material === "GLASS" ? 1.0 : 0.55;
-      if (Math.random() < 0.060 * sparkle) {
+      if (Math.random() < V.sparkleChance * sparkle) {
         g.fillStyle = "rgba(255,255,255,0.10)";
         g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
       }
@@ -617,8 +617,7 @@ export function createPhysicsLayer(
       canvas.height = h;
       canvas.style.width = "100vw";
       canvas.style.height = "100vh";
-      rebuildBounds();
-      rebuildBodies();
+      rebuildAll();
     },
     setMouse: (MX: number, MY: number) => {
       mx = MX / Math.max(w, 1);
@@ -636,10 +635,10 @@ export function createPhysicsLayer(
       if (n === "GLASS" || n === "CERAMIC" || n === "METAL") material = n;
     },
     setDensity: (count: number) => {
-      const c = clamp(Math.round(count), 80, 220);
+      const c = clamp(Math.round(count), 60, 240);
       if (c === cfg.count) return;
       cfg.count = c;
-      rebuildBodies();
+      rebuildAll();
     },
     step: (t: number, dt: number) => {
       acc += dt;
