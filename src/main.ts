@@ -29,6 +29,10 @@ const CONFIG = {
   }
 } as const;
 
+let mood = 0; // 0..1
+let moodTarget = 0;
+let moodTimer = 0;
+
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
@@ -197,6 +201,7 @@ layer3.setAttribute("aria-hidden", "true");
 document.body.appendChild(layer3);
 
 type PhysicsApi = {
+  setMood: (mood: number) => void;
   resize: (w: number, h: number, dpr: number) => void;
   setMouse: (mx: number, my: number) => void;
   step: (t: number, dt: number) => void;
@@ -211,6 +216,8 @@ async function initPhysics() {
   const mod = await import("./physics");
   physicsApi = mod.createPhysicsLayer(layer3, CONFIG.physics, noise2, clamp, lerp);
 
+  // initial mood
+  physicsApi.setMood(0);
   resize();
 }
 
@@ -231,6 +238,15 @@ function loop(now: number) {
     if (!CONFIG.reducedMotion) stepComponents(dt);
 
     renderer.render(scene, camera);
+
+    // Art Director mood cycle (slow + cinematic)
+    moodTimer += dt;
+    if (moodTimer > (12 + Math.random() * 8)) {
+      moodTimer = 0;
+      moodTarget = Math.random();
+    }
+    mood = mood + (moodTarget - mood) * 0.02;
+    if (physicsApi) physicsApi.setMood(mood);
 
     if (physicsApi && !CONFIG.reducedMotion) {
       physicsApi.step(uniforms.uTime.value, dt);

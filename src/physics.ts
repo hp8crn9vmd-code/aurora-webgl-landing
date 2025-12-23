@@ -22,13 +22,11 @@ type Lerp = (a: number, b: number, t: number) => number;
 const TAU = Math.PI * 2;
 
 function rand01(seed: number) {
-  // deterministic-ish random per body for "character" (still overall non-deterministic)
   const x = Math.sin(seed * 12.9898) * 43758.5453;
   return x - Math.floor(x);
 }
 
 function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
-  // divergence-free flow => organic, unpredictable, not jittery
   const e = 0.75;
   const n1 = noise2(x + e + t * 0.25, y);
   const n2 = noise2(x - e + t * 0.25, y);
@@ -38,8 +36,19 @@ function curlNoise(noise2: Noise2, x: number, y: number, t: number) {
   const dx = (n1 - n2) / (2 * e);
   const dy = (n3 - n4) / (2 * e);
 
-  // curl = (dy, -dx)
   return { x: dy, y: -dx };
+}
+
+// mood palettes (cool -> neon -> violet -> ice)
+function palette(mood: number) {
+  // 0..1
+  if (mood < 0.33) {
+    return { r: 190, g: 225, b: 255 }; // ice blue
+  } else if (mood < 0.66) {
+    return { r: 175, g: 255, b: 235 }; // neon mint
+  } else {
+    return { r: 215, g: 190, b: 255 }; // soft violet
+  }
 }
 
 export function createPhysicsLayer(
@@ -66,14 +75,20 @@ export function createPhysicsLayer(
   let mx = 0.5;
   let my = 0.5;
 
-  // visual / composition knobs (art-directed)
+  // art director state
+  let mood = 0; // 0..1
+
   const V = {
-    glowA: 0.075,
-    glowB: 0.018,
-    glassFill: 0.055,
-    glassStroke: 0.10,
-    highlight: 0.09,
-    sparkleChance: 0.05,
+    glowA: 0.085,
+    glowB: 0.020,
+    glassFill: 0.060,
+    glassStroke: 0.11,
+    highlight: 0.095,
+    sparkleChance: 0.055,
+
+    // composition
+    centerForce: 0.000004, // prevent “stuck in corners”
+    edgeRepel: 0.000010,
   } as const;
 
   function rebuildBounds() {
@@ -103,7 +118,6 @@ export function createPhysicsLayer(
 
     let b: Matter.Body;
 
-    // more "designed" shapes with chamfer (rounded corners)
     if (kind < 0.40) {
       b = Bodies.circle(x, y, base * 0.95, common);
     } else if (kind < 0.72) {
@@ -119,11 +133,10 @@ export function createPhysicsLayer(
       });
     }
 
-    // "character" parameters for each body
     (b as any)._seed = Math.random() * 1e9;
     (b as any)._style = {
-      hue: rand01(i * 97.1) * 60 + 190,            // cool range
-      tint: rand01(i * 33.7) * 0.35 + 0.35,        // subtle variation
+      hue: rand01(i * 97.1) * 60 + 190,
+      tint: rand01(i * 33.7) * 0.35 + 0.35,
       massBias: rand01(i * 12.2) * 0.8 + 0.6,
       flow: rand01(i * 66.6) * 1.4 + 0.6,
       impulse: rand01(i * 88.8) * 1.2 + 0.4,
@@ -141,10 +154,8 @@ export function createPhysicsLayer(
     bodies = [];
     constraints = [];
 
-    // create bodies
     for (let i = 0; i < cfg.count; i++) bodies.push(makeBody(i));
 
-    // build "clusters" of soft constraints (gives advanced emergent motion)
     const clusters = 3;
     const per = Math.max(6, Math.floor(cfg.count / clusters));
     for (let c = 0; c < clusters; c++) {
@@ -153,7 +164,6 @@ export function createPhysicsLayer(
       const group = bodies.slice(start, end);
       if (group.length < 3) continue;
 
-      // star constraints to a chosen hub
       const hub = group[Math.floor(Math.random() * group.length)];
       for (const b of group) {
         if (b === hub) continue;
@@ -169,7 +179,6 @@ export function createPhysicsLayer(
         );
       }
 
-      // ring constraints (adds organic wobble)
       for (let i = 0; i < group.length; i++) {
         const a = group[i];
         const b = group[(i + 1) % group.length];
@@ -186,7 +195,6 @@ export function createPhysicsLayer(
       }
     }
 
-    // add a few cross-links for complexity
     const cross = Math.floor(cfg.count * cfg.constraintRatio);
     for (let i = 0; i < cross; i++) {
       const a = bodies[Math.floor(Math.random() * bodies.length)];
@@ -208,11 +216,32 @@ export function createPhysicsLayer(
     Composite.add(world, constraints);
   }
 
+  function applyCompositionForces(b: Matter.Body) {
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+
+    // keep composition centered (very soft)
+    const dxC = (cx - b.position.x) / Math.max(w, 1);
+    const dyC = (cy - b.position.y) / Math.max(h, 1);
+    Body.applyForce(b, b.position, { x: dxC * V.centerForce, y: dyC * V.centerForce });
+
+    // repel from edges to avoid corner clustering
+    const margin = 120;
+    const left = (margin - b.position.x);
+    const right = (b.position.x - (w - margin));
+    const top = (margin - b.position.y);
+    const bottom = (b.position.y - (h - margin));
+
+    if (left > 0) Body.applyForce(b, b.position, { x: V.edgeRepel * (left / margin), y: 0 });
+    if (right > 0) Body.applyForce(b, b.position, { x: -V.edgeRepel * (right / margin), y: 0 });
+    if (top > 0) Body.applyForce(b, b.position, { x: 0, y: V.edgeRepel * (top / margin) });
+    if (bottom > 0) Body.applyForce(b, b.position, { x: 0, y: -V.edgeRepel * (bottom / margin) });
+  }
+
   function applyForces(t: number) {
     const wSafe = Math.max(w, 1);
     const hSafe = Math.max(h, 1);
 
-    // slow drift anchors (subtle, makes composition feel "alive")
     const ax = (0.5 + 0.15 * Math.sin(t * 0.17)) * wSafe;
     const ay = (0.5 + 0.15 * Math.cos(t * 0.13)) * hSafe;
 
@@ -223,18 +252,15 @@ export function createPhysicsLayer(
       const px = b.position.x * 0.004;
       const py = b.position.y * 0.004;
 
-      // curl flow field (main source of non-predictable but smooth motion)
       const c = curlNoise(noise2, px, py, t);
       const fx = c.x * cfg.turbulence * 1.25 * st.flow;
       const fy = c.y * cfg.turbulence * 1.25 * st.flow;
       Body.applyForce(b, b.position, { x: fx, y: fy });
 
-      // ultra-soft attraction to moving anchors (keeps scene coherent)
       const dxA = (ax - b.position.x) / wSafe;
       const dyA = (ay - b.position.y) / hSafe;
       Body.applyForce(b, b.position, { x: dxA * 0.000003, y: dyA * 0.000003 });
 
-      // mouse interaction (premium)
       const dx = b.position.x / wSafe - mx;
       const dy = b.position.y / hSafe - my;
       const dist = Math.sqrt(dx * dx + dy * dy) * Math.max(wSafe, hSafe);
@@ -243,7 +269,6 @@ export function createPhysicsLayer(
         Body.applyForce(b, b.position, { x: -dx * s, y: -dy * s });
       }
 
-      // rare impulses (unpredictable “events”)
       const chance = cfg.impulseChance * st.impulse;
       if (Math.random() < chance) {
         Body.applyForce(b, b.position, {
@@ -253,8 +278,9 @@ export function createPhysicsLayer(
         Body.setAngularVelocity(b, b.angularVelocity + (Math.random() - 0.5) * 0.28);
       }
 
-      // slightly different damping per body => richer motion
       b.frictionAir = clamp(cfg.frictionAir * (0.85 + st.massBias * 0.25), 0.007, 0.03);
+
+      applyCompositionForces(b);
     }
   }
 
@@ -270,37 +296,36 @@ export function createPhysicsLayer(
       g.fillRect(0, 0, w, h);
     }
 
-    // additive glow pass
+    const pal = palette(mood);
+
+    // additive glow
     g.save();
     g.globalCompositeOperation = "lighter";
-
     for (const b of bodies) {
-      const st = (b as any)._style as { hue: number; tint: number };
+      const st = (b as any)._style as { tint: number };
       const x = b.position.x;
       const y = b.position.y;
-
       const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
 
-      const grad = g.createRadialGradient(x, y, 0, x, y, r * 2.8);
-      grad.addColorStop(0, `rgba(180,220,255,${V.glowA * st.tint})`);
-      grad.addColorStop(1, `rgba(180,220,255,0.0)`);
+      const grad = g.createRadialGradient(x, y, 0, x, y, r * 3.0);
+      grad.addColorStop(0, `rgba(${pal.r},${pal.g},${pal.b},${V.glowA * st.tint})`);
+      grad.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},0.0)`);
       g.fillStyle = grad;
       g.beginPath();
-      g.arc(x, y, r * 2.8, 0, TAU);
+      g.arc(x, y, r * 3.0, 0, TAU);
       g.fill();
     }
     g.restore();
 
-    // main glass bodies
+    // glass bodies
     for (const b of bodies) {
-      const st = (b as any)._style as { hue: number; tint: number };
+      const st = (b as any)._style as { tint: number };
       const x = b.position.x;
       const y = b.position.y;
       const angle = b.angle;
 
-      // subtle colored glass (still mostly white/ice)
       const baseA = 0.040 + 0.020 * st.tint;
-      const strokeA = V.glassStroke;
+      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
 
       g.save();
       g.translate(x, y);
@@ -312,26 +337,22 @@ export function createPhysicsLayer(
       for (let i = 1; i < verts.length; i++) g.lineTo(verts[i].x - x, verts[i].y - y);
       g.closePath();
 
-      // gradient fill inside shape (more premium than flat fill)
-      const r = clamp((b.bounds.max.x - b.bounds.min.x) * 0.34, 10, 30);
       const lg = g.createLinearGradient(-r, -r, r, r);
       lg.addColorStop(0, `rgba(255,255,255,${baseA})`);
-      lg.addColorStop(1, `rgba(210,235,255,${V.glassFill * st.tint})`);
+      lg.addColorStop(1, `rgba(${pal.r},${pal.g},${pal.b},${V.glassFill * st.tint})`);
       g.fillStyle = lg;
       g.fill();
 
-      g.strokeStyle = `rgba(255,255,255,${strokeA})`;
+      g.strokeStyle = `rgba(255,255,255,${V.glassStroke})`;
       g.lineWidth = 1;
       g.stroke();
 
-      // specular highlight
       g.strokeStyle = `rgba(255,255,255,${V.highlight})`;
       g.beginPath();
       g.moveTo(-r * 0.65, -r * 0.55);
       g.lineTo(r * 0.15, -r * 0.95);
       g.stroke();
 
-      // micro sparkle (rare)
       if (Math.random() < V.sparkleChance) {
         g.fillStyle = "rgba(255,255,255,0.12)";
         g.fillRect(-r * 0.15, -r * 0.05, 1.5, 1.5);
@@ -355,6 +376,9 @@ export function createPhysicsLayer(
     setMouse: (MX: number, MY: number) => {
       mx = MX / Math.max(w, 1);
       my = MY / Math.max(h, 1);
+    },
+    setMood: (m: number) => {
+      mood = clamp(m, 0, 1);
     },
     step: (t: number, dt: number) => {
       acc += dt;
